@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  uac-expect-reject.xml — acceptance criterion 3.
+
+  Sends an otherwise-valid INVITE from a source IP that is NOT on the
+  customer allowlist. The SBC must refuse it.
+
+  Any of 403 / 401 / 404 counts as a refusal:
+
+    403  res_pjsip_acl matched the blanket deny in [sbc-acl]. This is what
+         a correctly configured box returns and what you should see.
+    401  the ACL let it through but no identify matched, so res_pjsip
+         challenged it with the artificial endpoint's auth. The caller
+         cannot answer the challenge, so the call still dies — but seeing
+         401 here means the [sbc-acl] section is not doing its job and you
+         are relying on one layer instead of two. Investigate.
+    404  matched no dialplan extension.
+
+  A 200 is a hard failure and means an unauthorized party can originate
+  calls through your FracTEL trunk. The scenario is built so that a 200
+  falls through to the mandatory 403 step, does not match, and fails the
+  run — there is no path here that treats a completed call as success.
+
+  IMPORTANT: run on-box, this exercises the Asterisk ACL only. The host
+  firewall is NOT tested — see tests/README.md.
+
+  Run:
+    sipp -sf uac-expect-reject.xml -inf destinations.csv \
+         -i 127.0.0.99 -m 1 127.0.0.1:5060
+-->
+
+<scenario name="Unauthorized source must be rejected">
+
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      User-Agent: SIPp-AcceptanceTest
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=sipp 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0 8
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:8 PCMA/8000
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="401" optional="true" next="acked"/>
+  <recv response="404" optional="true" next="acked"/>
+  <recv response="403"/>
+
+  <label id="acked"/>
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+</scenario>

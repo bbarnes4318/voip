@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Secrets and site-specific config. NEVER commit these.
+# ---------------------------------------------------------------------------
+config.env
+*.env
+!*.env.example
+!tests/config.test.env.example
+
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*.der
+*.jks
+.htpasswd
+secrets/
+
+# ---------------------------------------------------------------------------
+# Rendered Asterisk configuration. Only the .tpl files are tracked; the
+# rendered .conf files contain real customer and carrier IPs.
+# ---------------------------------------------------------------------------
+asterisk/*.conf
+rendered/
+/etc-asterisk-backup/
+
+# ---------------------------------------------------------------------------
+# Call detail records, SIP traces, logs. Contain phone numbers and IPs.
+# ---------------------------------------------------------------------------
+cdr/
+*.log
+*.pcap
+*.pcap.*
+siptrace/
+tests/results/
+RUNBOOK-acceptance.generated.md
+
+# ---------------------------------------------------------------------------
+# Test fixtures are FAKE numbers and are deliberately tracked. Whitelisted
+# here so no broader rule above can swallow them.
+# ---------------------------------------------------------------------------
+!tests/sipp/*.csv
+!tests/sipp/*.xml
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

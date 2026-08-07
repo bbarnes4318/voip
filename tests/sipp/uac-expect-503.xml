@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  uac-expect-503.xml — acceptance criteria 5, 6 and 7.
+
+  Same INVITE as the happy path, sent from an AUTHORIZED source IP but with a
+  condition the dialplan must refuse:
+
+    crit 5 — destination outside NANP     (destinations-badnanp.csv)
+    crit 6 — over the per-IP concurrency cap
+    crit 7 — over the CPS cap
+
+  All three are dialplan-layer rejections. [sbc-customer] ends each of them
+  with Hangup(34), which chan_pjsip maps to 503 Service Unavailable.
+
+  A 200 on the non-NANP case is the most dangerous failure in this suite: it
+  means a compromised customer dialer can bill premium-rate international to
+  the FracTEL account. The mandatory 503 step below will not match a 200, so
+  that case fails the run.
+
+  Note that 403 is NOT accepted here. Bad caller ID is refused with 403 by
+  design (see uac-expect-403-badcid.xml); if a destination or capacity test
+  returns 403, the call was rejected for the wrong reason and the test should
+  fail rather than quietly pass.
+
+  Run (non-NANP):
+    sipp -sf uac-expect-503.xml -inf destinations-badnanp.csv \
+         -i 127.0.0.11 -m 3 127.0.0.1:5060
+-->
+
+<scenario name="Dialplan rejection must return 503">
+
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      User-Agent: SIPp-AcceptanceTest
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=sipp 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0 8
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:8 PCMA/8000
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="503" rtd="true"/>
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+</scenario>

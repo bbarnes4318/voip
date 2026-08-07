@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  uac-expect-403-badcid.xml — caller ID validation.
+
+  Sent from an AUTHORIZED source IP to a VALID NANP destination, but with a
+  caller ID the dialplan must refuse: empty, alphabetic, too short, or
+  identical to the number being dialled. See destinations-badcid.csv.
+
+  Expected response is 403 Forbidden, not 503. That distinction is
+  deliberate: 503 means "try again later" and a dialer will happily retry the
+  same broken CID forever, whereas 403 means "this call is wrong" and should
+  push the customer to fix their configuration.
+
+  What must not happen is a call completing to the carrier with an empty or
+  non-numeric caller ID. That is what generates tracebacks, and answering a
+  traceback for a call whose originating number was blank is not a
+  conversation you want to have.
+
+  Run:
+    sipp -sf uac-expect-403-badcid.xml -inf destinations-badcid.csv \
+         -i 127.0.0.11 -m 4 127.0.0.1:5060
+
+  Note: SIPp injects [field1] into both the From display name and the From
+  user part. The empty-CID row therefore produces From: "" <sip:@host>, which
+  is what a real dialer with an unset CID sends.
+-->
+
+<scenario name="Malformed caller ID must return 403">
+
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      User-Agent: SIPp-AcceptanceTest
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=sipp 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0 8
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:8 PCMA/8000
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="403" rtd="true"/>
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+</scenario>
