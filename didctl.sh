@@ -232,7 +232,12 @@ pools)
   echo
   echo "  ${B}pools in the RUNNING dialplan${N}  ${D}(not what dids.csv says — what Asterisk loaded)${N}"
   echo
+  # `dialplan show globals` INDENTS every line. An anchored ^SBC_ pattern
+  # matches nothing and this silently reports zero pools on a box that has
+  # them, which reads as "the pool failed to load" during a deploy. Strip the
+  # leading whitespace first.
   "$AST" -rx "dialplan show globals" 2>/dev/null \
+    | sed 's/^[[:space:]]*//' \
     | grep -E '^SBC_DID_(POOL|CNT)_' \
     | sort \
     | awk -F'=' '
@@ -247,7 +252,8 @@ pools)
           }
         }' | sed 's/^/  /'
   echo
-  CAP="$("$AST" -rx "dialplan show globals" 2>/dev/null | awk -F'=' '/^SBC_DID_CAP/{print $2}')"
+  CAP="$("$AST" -rx "dialplan show globals" 2>/dev/null \
+         | sed 's/^[[:space:]]*//' | awk -F'=' '/^SBC_DID_CAP=/{print $2}')"
   echo "    daily cap per DID: ${CAP:-unknown}"
   echo
   ;;

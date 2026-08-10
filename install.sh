@@ -547,8 +547,12 @@ for fn in LOCK TRYLOCK UNLOCK DB DIALPLAN_EXISTS CUT IF STRFTIME; do
 done
 
 # --- DID pool actually reached the running dialplan -----------------------
-POOLN="$(asterisk -rx "dialplan show globals" 2>/dev/null | grep -c '^SBC_DID_POOL_' || true)"
-OVF="$(asterisk -rx "dialplan show globals" 2>/dev/null | awk -F'=' '/^SBC_DID_CNT_OVERFLOW/{print $2}')"
+# `dialplan show globals` indents its output, so these must strip leading
+# whitespace before anchoring — otherwise validation reports zero pools on a
+# box whose pools loaded perfectly.
+GLOBALS="$(asterisk -rx "dialplan show globals" 2>/dev/null | sed 's/^[[:space:]]*//')"
+POOLN="$(grep -c '^SBC_DID_POOL_' <<< "$GLOBALS" || true)"
+OVF="$(awk -F'=' '/^SBC_DID_CNT_OVERFLOW=/{print $2}' <<< "$GLOBALS")"
 if [[ "${POOLN:-0}" -lt 1 || -z "$OVF" ]]; then
   echo "    DID pool did not load into the dialplan — the SBC cannot assign caller ID" >&2
   FAILED=1
