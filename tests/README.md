@@ -29,6 +29,12 @@ sipp/destinations-cap.csv         crit 14  — NPA 989, which has ONE DID
 sipp/destinations-overflow.csv    crit 15  — NPA 505, which has NO pool
 sipp/destinations-blocked.csv     crit 16  — blocklisted, incl. longest-match
 sipp/destinations-volume.csv      crit 13/17 — 40 destinations over 8 NPAs
+sipp/uac-invite-timed.xml         hold time set by -d      crit 19, 20, 21, 23
+sipp/destinations-transfer-tf.csv      crit 18 — 844, toll-free
+sipp/destinations-transfer-learn.csv   crit 19/23 — learned then suppressed
+sipp/destinations-transfer-short.csv   crit 20 — never long enough to track
+sipp/destinations-transfer-twice.csv   crit 21 — long enough, not often enough
+sipp/destinations-transfer-blocked.csv crit 22 — toll-free AND blocklisted
 ```
 
 Every phone number in the fixtures is in the **555-01XX** range that NANPA
@@ -43,12 +49,17 @@ ID either.
 Two things are different from a normal test run and you should know about both
 before running it on anything you care about.
 
-**It zeroes the per-DID daily counters.** Those counters live in the Asterisk
-database and survive restarts *by design* — that is what makes the cap a daily
-cap. Which means a second run of the suite would inherit the first run's
-counts and criterion 14 would behave differently every time. So the driver
-calls `didctl.sh reset --all --force` at startup, and again before criteria 13
-and 14.
+**It zeroes the per-DID daily counters and all learned transfer state.** Both
+live in the Asterisk database and survive restarts *by design* — that is what
+makes the cap a daily cap and what keeps a buyer line recognised across days.
+Which means a second run of the suite would inherit the first run's state, and
+criteria 14 and 19–21 would each behave differently the second time. So the
+driver calls `didctl.sh reset --all --force` and
+`didctl.sh transfers reset --force` at startup.
+
+Transfer state is the more disruptive of the two to lose on a live box: every
+buyer line then needs three answered calls to re-learn, and during that window
+their transfers go out with a pool DID and the buyer sees a stranger.
 
 On a box carrying customer traffic that would let every number carry another
 full day's allowance on top of what it has already sent. The driver only gets
@@ -255,6 +266,34 @@ answer them separately would only add time.
   the mean. **The "all six" half is the important one** — a broken rotation
   that buckets by wall-clock second, or one derived from `${UNIQUEID}`, still
   produces a plausible-looking even split across a *subset* of gateways.
+
+**Criteria 18–23 run with `TRANSFER_MIN_ACD=3`, not 60.** Criterion 19 as
+written is "3 calls at 90s each, the 4th is flagged" — 270 seconds of waiting
+to exercise an integer comparison. The test config scales the *threshold* down
+so the suite can place 6-second calls through the identical branch. Criteria
+20 and 21 scale with it: "5 short calls" become 1-second calls, still below
+the threshold, and "2 long calls" stay long enough to be tracked but too few
+to qualify.
+
+`TRANSFER_MIN_CALLS` is **not** scaled. It stays at 3, because 3 is the value
+validated against production CDRs and criteria 19 and 21 exist specifically to
+prove the boundary between 2 and 3. Scaling that would test nothing.
+
+**Criterion 22 is an ordering test, not a rejection test.** NPA 855 is
+toll-free, so rule 1 would call `18555550111` a transfer leg — but
+`blocklist.test.csv` also lists `1855555`, and the blocklist runs first in the
+dialplan. The test requires both that the call is refused with
+`HIGH_COST_PREFIX` *and* that `SBC-TRANSFER-LEG` was never logged for it. A
+transfer leg is not a trusted call; it is a call whose caller ID we do not
+own. (A generated blocklist would never contain a toll-free row —
+`build-blocklist.py` excludes those NPAs — so that row is hand-added purely to
+prove the ordering holds if one ever did.)
+
+**Criterion 23 requires suppression, not deletion.** After
+`didctl.sh transfers remove`, the test places three *more* long answered calls
+and requires the destination to still be un-flagged. A `remove` implemented as
+a plain delete would pass the first half and fail here, because the next three
+calls would silently re-learn it.
 
 The volume phase swaps in `uas-fractel-stub-fast.xml` and
 `uac-invite-fast.xml`. The normal fixtures hold each call for 20 seconds

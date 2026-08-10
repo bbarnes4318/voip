@@ -182,7 +182,12 @@ fi
 # this is not a box carrying customer traffic.
 if [[ -x "$ROOT/didctl.sh" ]]; then
   "$ROOT/didctl.sh" reset --all --force >/dev/null 2>&1
-  note "DID daily counters cleared for today (test config only)"
+  # Learned transfer destinations are NOT date-keyed and do not roll over at
+  # midnight — that is the point, a buyer line has to stay recognised. So a
+  # rerun would inherit whatever the last run taught it and criteria 19-21
+  # would each behave differently the second time.
+  "$ROOT/didctl.sh" transfers reset --force >/dev/null 2>&1
+  note "DID daily counters and learned transfer state cleared (test config only)"
 fi
 
 # --- start the FracTEL stub farm -----------------------------------------
@@ -688,6 +693,203 @@ if sipp_run blocked uac-expect-503.xml destinations-blocked.csv "$PK1" 5061 -m "
   fi
 else
   fail "crit 16" "a blocklisted destination was NOT refused — see $LOGDIR/blocked.msg"
+fi
+
+# ===========================================================================
+# Criteria 18-23 — transfer-leg detection
+# ===========================================================================
+# A transfer leg is an agent bridging a live prospect to the US buyer. The
+# buyer must see the PROSPECT's number, so on these calls the customer's
+# caller ID is passed through untouched and no DID is drawn.
+#
+# Detection is on the DESTINATION. There is deliberately no caller-ID-based
+# rule anywhere in this: the customer sends arbitrary caller ID on every call,
+# which is the entire reason this SBC exists.
+XF_MINACD="${TRANSFER_MIN_ACD:-60}"
+XF_MINCALLS="${TRANSFER_MIN_CALLS:-3}"
+# Comfortably over and comfortably under the ACD threshold.
+XF_LONG_MS=$(( (XF_MINACD + 3) * 1000 ))
+XF_SHORT_MS=1000
+
+if [[ "${TRANSFER_DETECT:-true}" != "true" ]]; then
+  for c in 18 19 20 21 22 23; do
+    skip "crit $c" "TRANSFER_DETECT=false in $CONF"
+  done
+else
+  "$ROOT/didctl.sh" transfers reset --force >/dev/null 2>&1
+
+  # --- criterion 18: toll-free destination, stateless rule 1 --------------
+  DEST18=18445550111
+  CID18=2125551234
+  M="$(mark)"
+  if ! sipp_run xfer18 uac-invite.xml destinations-transfer-tf.csv "$PK1" 5061 -m 1 -d 3000; then
+    fail "crit 18" "call to toll-free $DEST18 did not complete"
+    note "see $LOGDIR/xfer18.msg"
+  else
+    INV18="$(outbound_invite "$DEST18")"
+    R18="$(since "$M" | grep 'SBC-DIAL ' | grep -F "dst=$DEST18 " \
+           | sed -n 's/.*[ ]xfer=\([a-z_]*\).*/\1/p' | tail -1)"
+    DID18="$(did_for "$M" "$DEST18")"
+    F18="$(grep  -i '^From:'                 <<< "$INV18" | head -1)"
+    P18="$(grep  -i '^P-Asserted-Identity:'  <<< "$INV18" | head -1)"
+    RP18="$(grep -i '^Remote-Party-ID:'      <<< "$INV18" | head -1)"
+    MISS18=""
+    grep -q "$CID18" <<< "$F18"  || MISS18+="From "
+    grep -q "$CID18" <<< "$P18"  || MISS18+="P-Asserted-Identity "
+    grep -q "$CID18" <<< "$RP18" || MISS18+="Remote-Party-ID "
+
+    if [[ -z "$INV18" ]]; then
+      fail "crit 18" "no INVITE toward $DEST18 found in any stub trace"
+    elif [[ -z "$MISS18" && "$R18" == "transfer_leg_tollfree" && -z "$DID18" ]]; then
+      pass "crit 18" "toll-free $DEST18: customer CID intact in all three headers, no DID drawn"
+      note "tagged transfer_leg_tollfree with no state to warm up — rule 1 fired on the first call"
+      note "$(sed 's/^[[:space:]]*//' <<< "$F18")"
+      note "$(sed 's/^[[:space:]]*//' <<< "${P18:-P-Asserted-Identity: (ABSENT)}")"
+    elif [[ -n "$DID18" ]]; then
+      fail "crit 18" "a pool DID ($DID18) was drawn for a transfer leg"
+    elif [[ "$R18" != "transfer_leg_tollfree" ]]; then
+      fail "crit 18" "expected transfer_leg_tollfree, got '${R18:-none}'"
+    else
+      fail "crit 18" "customer CID missing from: $MISS18"
+      note "expected $CID18 in each; this is the buyer's callback path"
+    fi
+  fi
+
+  # --- criteria 19 and 23: learned destination ----------------------------
+  # Not toll-free, no pool of its own, not blocklisted — so before learning it
+  # is an ordinary prospect dial that goes to overflow.
+  DEST19=17195550101
+  M="$(mark)"
+  for i in $(seq 1 "$XF_MINCALLS"); do
+    sipp_run "xfer19_$i" uac-invite-timed.xml destinations-transfer-learn.csv \
+             "$PK1" 5061 -m 1 -d "$XF_LONG_MS" >/dev/null 2>&1
+  done
+  sleep 2
+  M2="$(mark)"
+  sipp_run xfer19b uac-invite-timed.xml destinations-transfer-learn.csv "$PK1" 5061 -m 1 -d 2000
+  sleep 1
+  R19="$(since "$M2" | grep 'SBC-DIAL ' | grep -F "dst=$DEST19 " \
+         | sed -n 's/.*[ ]xfer=\([a-z_]*\).*/\1/p' | tail -1)"
+  DID19="$(did_for "$M2" "$DEST19")"
+  EARLY="$(since "$M" | grep 'SBC-DIAL ' | grep -F "dst=$DEST19 " \
+           | sed -n 's/.*[ ]xfer=\([a-z_]*\).*/\1/p' | head -1)"
+
+  if [[ "$R19" == "transfer_leg_learned" && -z "$DID19" ]]; then
+    pass "crit 19" "after $XF_MINCALLS answered calls over ${XF_MINACD}s, call $((XF_MINCALLS + 1)) tagged transfer_leg_learned"
+    note "the first $XF_MINCALLS went out as prospect dials (xfer='${EARLY:-none}') — the accepted warm-up"
+    note "$(since "$M2" | grep 'SBC-TRANSFER-LEG' | tail -1 | sed 's/.*SBC-TRANSFER/SBC-TRANSFER/')"
+  elif [[ -n "$DID19" ]]; then
+    fail "crit 19" "call $((XF_MINCALLS + 1)) still drew a pool DID ($DID19); xfer='${R19:-none}'"
+    note "$("$ROOT/didctl.sh" transfers list 2>/dev/null | grep "$DEST19" || echo 'no state stored')"
+  else
+    fail "crit 19" "expected transfer_leg_learned, got '${R19:-none}'"
+  fi
+
+  # --- criterion 23: remove un-flags AND suppresses re-learning -----------
+  "$ROOT/didctl.sh" transfers remove "$DEST19" >/dev/null 2>&1
+  M="$(mark)"
+  sipp_run xfer23 uac-invite-timed.xml destinations-transfer-learn.csv "$PK1" 5061 -m 1 -d 2000
+  sleep 1
+  R23A="$(since "$M" | grep 'SBC-DIAL ' | grep -F "dst=$DEST19 " \
+          | sed -n 's/.*[ ]xfer=\([a-z_]*\).*/\1/p' | tail -1)"
+  DID23A="$(did_for "$M" "$DEST19")"
+  # Now try to re-learn it: enough long answered calls to qualify all over again.
+  for i in $(seq 1 "$XF_MINCALLS"); do
+    sipp_run "xfer23_$i" uac-invite-timed.xml destinations-transfer-learn.csv \
+             "$PK1" 5061 -m 1 -d "$XF_LONG_MS" >/dev/null 2>&1
+  done
+  sleep 2
+  M2="$(mark)"
+  sipp_run xfer23b uac-invite-timed.xml destinations-transfer-learn.csv "$PK1" 5061 -m 1 -d 2000
+  sleep 1
+  R23B="$(since "$M2" | grep 'SBC-DIAL ' | grep -F "dst=$DEST19 " \
+          | sed -n 's/.*[ ]xfer=\([a-z_]*\).*/\1/p' | tail -1)"
+
+  if [[ -z "$R23A" && -n "$DID23A" && -z "$R23B" ]]; then
+    pass "crit 23" "transfers remove un-flagged $DEST19 and $XF_MINCALLS more long calls did not re-learn it"
+    note "suppressed rather than deleted — a plain delete would be undone by the next $XF_MINCALLS calls"
+  elif [[ -n "$R23A" ]]; then
+    fail "crit 23" "still tagged '$R23A' immediately after transfers remove"
+  elif [[ -n "$R23B" ]]; then
+    fail "crit 23" "un-flagged, but re-learned as '$R23B' after $XF_MINCALLS more calls"
+    note "remove must suppress, not just delete the counters"
+  else
+    fail "crit 23" "un-flagged but no pool DID was drawn either — check the rewrite path"
+  fi
+
+  # --- criterion 20: short calls never start tracking ---------------------
+  # Guards the ACD condition. Five answered calls, none long enough to create
+  # an entry at all, so the destination is never even a candidate.
+  DEST20=17195550102
+  M="$(mark)"
+  sipp_run xfer20 uac-invite-timed.xml destinations-transfer-short.csv \
+           "$PK1" 5061 -m 5 -r 1 -d "$XF_SHORT_MS"
+  sleep 2
+  M2="$(mark)"
+  sipp_run xfer20b uac-invite-timed.xml destinations-transfer-short.csv "$PK1" 5061 -m 1 -d 2000
+  sleep 1
+  R20="$(since "$M2" | grep 'SBC-DIAL ' | grep -F "dst=$DEST20 " \
+         | sed -n 's/.*[ ]xfer=\([a-z_]*\).*/\1/p' | tail -1)"
+  DID20="$(did_for "$M2" "$DEST20")"
+  TRACKED20="$("$ROOT/didctl.sh" transfers list 2>/dev/null | grep -c "$DEST20" || true)"
+  if [[ -z "$R20" && -n "$DID20" ]]; then
+    pass "crit 20" "5 answered calls of ${XF_SHORT_MS}ms did not flag $DEST20; full rewrite still applied (DID $DID20)"
+    note "no state was even created for it (${TRACKED20} row(s)) — a destination is not tracked until"
+    note "one answered call exceeds ${XF_MINACD}s, which is what keeps ~42k daily destinations out of the database"
+  elif [[ -n "$R20" ]]; then
+    fail "crit 20" "short calls flagged $DEST20 as '$R20' — the ACD condition is not holding"
+  else
+    fail "crit 20" "not flagged, but no DID was drawn either"
+  fi
+
+  # --- criterion 21: two long calls are not enough ------------------------
+  # Guards the >=3 count. A threshold of 2 was measured to flag six
+  # destinations instead of one.
+  DEST21=17195550103
+  M="$(mark)"
+  sipp_run xfer21 uac-invite-timed.xml destinations-transfer-twice.csv \
+           "$PK1" 5061 -m 2 -r 1 -d "$XF_LONG_MS"
+  sleep 2
+  M2="$(mark)"
+  sipp_run xfer21b uac-invite-timed.xml destinations-transfer-twice.csv "$PK1" 5061 -m 1 -d 2000
+  sleep 1
+  R21="$(since "$M2" | grep 'SBC-DIAL ' | grep -F "dst=$DEST21 " \
+         | sed -n 's/.*[ ]xfer=\([a-z_]*\).*/\1/p' | tail -1)"
+  DID21="$(did_for "$M2" "$DEST21")"
+  if [[ -z "$R21" && -n "$DID21" ]]; then
+    pass "crit 21" "2 answered calls over ${XF_MINACD}s did not flag $DEST21 (threshold is $XF_MINCALLS); full rewrite applied"
+    note "$("$ROOT/didctl.sh" transfers list 2>/dev/null | grep "$DEST21" | sed 's/^ *//' || echo 'tracked but below threshold')"
+  elif [[ -n "$R21" ]]; then
+    fail "crit 21" "two calls flagged $DEST21 as '$R21' — the count threshold is below $XF_MINCALLS"
+  else
+    fail "crit 21" "not flagged, but no DID was drawn either"
+  fi
+
+  # --- criterion 22: the blocklist still wins -----------------------------
+  # 855 is toll-free, so rule 1 would call this a transfer leg. The blocklist
+  # runs first and has to refuse it anyway: a transfer leg is not a trusted
+  # call, it is a call whose caller ID we do not own.
+  DEST22=18555550111
+  M="$(mark)"
+  if sipp_run xfer22 uac-expect-503.xml destinations-transfer-blocked.csv "$PK1" 5061 -m 1; then
+    R22="$(since "$M" | grep 'HIGH_COST_PREFIX' | grep -cF "dst=$DEST22" || true)"
+    X22="$(since "$M" | grep -c "SBC-TRANSFER-LEG.*dst=$DEST22" || true)"
+    if [[ "$R22" -ge 1 && "$X22" -eq 0 ]]; then
+      pass "crit 22" "toll-free but blocklisted $DEST22 refused with 503 (HIGH_COST_PREFIX)"
+      note "transfer detection never ran — the cost control sits ahead of it in the dialplan"
+    elif [[ "$X22" -gt 0 ]]; then
+      fail "crit 22" "the call was treated as a transfer leg before the blocklist could refuse it"
+    else
+      fail "crit 22" "refused, but not by the blocklist"
+      note "$(since "$M" | grep 'SBC-REJECT' | tail -1)"
+    fi
+  else
+    fail "crit 22" "a blocklisted toll-free destination was NOT refused"
+    note "toll-free detection must not bypass the blocklist — see $LOGDIR/xfer22.msg"
+  fi
+
+  echo
+  "$ROOT/didctl.sh" transfers list 2>/dev/null | sed 's/^/  /'
 fi
 
 # ===========================================================================

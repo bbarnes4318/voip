@@ -94,6 +94,11 @@ VALIDATE_CALLERID="${VALIDATE_CALLERID:-false}"
 NORMALIZE_CALLERID="${NORMALIZE_CALLERID:-false}"
 DID_DAILY_CAP="${DID_DAILY_CAP:-200}"
 OVERFLOW_MIN="${OVERFLOW_MIN:-20}"
+TRANSFER_DETECT="${TRANSFER_DETECT:-true}"
+TRANSFER_TOLLFREE_NPAS="${TRANSFER_TOLLFREE_NPAS:-800,833,844,855,866,877,888}"
+TRANSFER_MIN_CALLS="${TRANSFER_MIN_CALLS:-3}"
+TRANSFER_MIN_ACD="${TRANSFER_MIN_ACD:-60}"
+TRANSFER_EXPIRE_DAYS="${TRANSFER_EXPIRE_DAYS:-30}"
 DIDS_CSV="${DIDS_CSV:-dids.csv}"
 BLOCKLIST_CSV="${BLOCKLIST_CSV:-blocklist.csv}"
 [[ "$DIDS_CSV"      = /* ]] || DIDS_CSV="$HERE/$DIDS_CSV"
@@ -115,6 +120,47 @@ SBC_NAT_LOCAL_NET="${SBC_NAT_LOCAL_NET:-}"
 [[ "$OVERFLOW_MIN" =~ ^[0-9]+$ ]] || \
   die "OVERFLOW_MIN must be an integer, got '$OVERFLOW_MIN'"
 
+[[ "$TRANSFER_MIN_CALLS" =~ ^[0-9]+$ ]] && (( TRANSFER_MIN_CALLS >= 1 )) || \
+  die "TRANSFER_MIN_CALLS must be a positive integer, got '$TRANSFER_MIN_CALLS'"
+[[ "$TRANSFER_MIN_ACD" =~ ^[0-9]+$ ]] || \
+  die "TRANSFER_MIN_ACD must be an integer, got '$TRANSFER_MIN_ACD'"
+[[ "$TRANSFER_EXPIRE_DAYS" =~ ^[0-9]+$ ]] || \
+  die "TRANSFER_EXPIRE_DAYS must be an integer, got '$TRANSFER_EXPIRE_DAYS'"
+
+# 3 and 60 were validated against production CDRs. 2 flags six destinations
+# instead of one. Loosening either turns a prospect dial into a transfer leg,
+# which means a customer-supplied caller ID reaches FracTEL unrewritten — the
+# exact failure this SBC exists to prevent, arriving through the back door.
+if (( TRANSFER_MIN_CALLS < 3 )) && [[ "$TRANSFER_DETECT" == "true" ]]; then
+  cat >&2 <<WARN
+
+  ############################################################
+  #  WARNING: TRANSFER_MIN_CALLS=$TRANSFER_MIN_CALLS
+  #
+  #  Below 3 this was measured to flag six destinations
+  #  instead of one. Every false positive is a prospect dial
+  #  that keeps the customer's caller ID instead of ours.
+  ############################################################
+
+WARN
+fi
+
+# The membership test in the dialplan is a regex against a comma-wrapped list,
+# so ",800," matches only the whole NPA and never a substring of a longer one.
+TF_CSV="$(echo "$TRANSFER_TOLLFREE_NPAS" | tr ' ' ',' | tr -s ',' | sed 's/^,//; s/,$//')"
+if [[ -n "$TF_CSV" ]]; then
+  IFS=',' read -r -a _tfn <<< "$TF_CSV"
+  for _n in "${_tfn[@]}"; do
+    [[ "$_n" =~ ^[2-9][0-9]{2}$ ]] || \
+      die "TRANSFER_TOLLFREE_NPAS entry '$_n' is not a 3-digit NPA starting 2-9"
+  done
+  SBC_TF_NPAS=",${TF_CSV},"
+else
+  SBC_TF_NPAS=","
+  [[ "$TRANSFER_DETECT" == "true" ]] && \
+    echo "  note: TRANSFER_TOLLFREE_NPAS is empty — rule 1 will never fire" >&2
+fi
+
 # cdr_custom always writes to <astlogdir>/cdr-custom/<name> and ignores any
 # directory component in the mapping key. A CDR_CSV_PATH pointing somewhere
 # else would render cleanly, start cleanly, and then silently produce no CDRs
@@ -126,7 +172,7 @@ if [[ "$(dirname "$CDR_CSV_PATH")" != "${ASTERISK_LOG_DIR:-/var/log/asterisk}/cd
        writes there). Got: $CDR_CSV_PATH"
 fi
 
-for b in NANP_ONLY BLOCK_HIGH_RISK_NPA BLOCK_976 VALIDATE_CALLERID NORMALIZE_CALLERID ENABLE_G729; do
+for b in NANP_ONLY BLOCK_HIGH_RISK_NPA BLOCK_976 VALIDATE_CALLERID NORMALIZE_CALLERID ENABLE_G729 TRANSFER_DETECT; do
   case "${!b}" in
     true|false) ;;
     *) die "$b must be exactly 'true' or 'false', got '${!b}'" ;;
@@ -342,8 +388,12 @@ while IFS= read -r _line || [[ -n "$_line" ]]; do
   _npa="${_line%%,*}"
   _rest="${_line#*,}"
   _did="${_rest%%,*}"
-  _npa="$(printf '%s' "$_npa" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-  _did="$(printf '%s' "$_did" | tr -cd '0-9')"
+  # Pure parameter expansion, no subshells. dids.csv can run to hundreds of
+  # rows and blocklist.csv to well over a thousand; at four forks a row this
+  # loop was the slowest thing in the whole render.
+  _npa="${_npa//[[:space:]]/}"
+  _npa="${_npa^^}"
+  _did="${_did//[!0-9]/}"
 
   # Optional header row.
   [[ "$_npa" == "NPA" ]] && continue
@@ -449,8 +499,8 @@ while IFS= read -r _line || [[ -n "$_line" ]]; do
   _dest="${_rest#*,}"
   [[ "$_rest" == *,* ]] || _dest=""
 
-  _pfx="$(printf '%s' "$_pfx" | tr -cd '0-9')"
-  _rate="$(printf '%s' "$_rate" | tr -d '[:space:]$')"
+  _pfx="${_pfx//[!0-9]/}"
+  _rate="${_rate//[[:space:]\$]/}"
 
   # Header row.
   [[ "$_line" == prefix,* ]] && continue
@@ -476,9 +526,11 @@ while IFS= read -r _line || [[ -n "$_line" ]]; do
   # A comma here would become a second Set() argument, and a quote would end
   # the value early. Carrier free-text does not survive contact with the
   # dialplan intact, so it gets flattened.
-  _dest="$(printf '%s' "$_dest" | tr -d '",;|' | tr -s '[:space:]' ' ')"
-  _dest="${_dest#"${_dest%%[![:space:]]*}"}"
-  _dest="${_dest%"${_dest##*[![:space:]]}"}"
+  _dest="${_dest//[\",;|]/ }"
+  # Word-splitting collapses runs of whitespace and trims both ends without
+  # forking tr twice per row.
+  read -r -a _dw <<< "$_dest"
+  _dest="${_dw[*]}"
   _dest="${_dest:0:40}"
 
   if [[ -n "${LRN_RATE[$_pfx]:-}" ]]; then
@@ -494,8 +546,14 @@ while IFS= read -r _line || [[ -n "$_line" ]]; do
   LRN_RATE[$_pfx]="$_rate"
   LRN_DEST[$_pfx]="$_dest"
   LRN_COUNT=$((LRN_COUNT + 1))
-  awk -v a="$_rate" -v b="$LRN_WORST" 'BEGIN{exit !(a>b)}' && LRN_WORST="$_rate"
 done < "$BLOCKLIST_CSV"
+
+# Worst rate and the count above $0.50 in ONE awk over the whole set, rather
+# than a fork per row. A real blocklist is ~1,250 rows.
+if (( LRN_COUNT > 0 )); then
+  read -r LRN_WORST LRN_N50 <<< "$(
+    printf '%s\n' "${LRN_RATE[@]}" | awk '$1>w{w=$1} $1>=0.50{n++} END{printf "%.6f %d", w+0, n+0}')"
+fi
 
 : > "$BLOCK_DIR/lrn_blocklist"
 if (( LRN_COUNT > 0 )); then
@@ -511,8 +569,7 @@ exten => ${_pat},1,Set(SBC_LRN_PREFIX=${_pfx})
  same => n,Return()
 EOF
   done
-  _n50="$(for r in "${LRN_RATE[@]}"; do echo "$r"; done | awk '$1>=0.50' | wc -l)"
-  info "LRN blocklist: $LRN_COUNT prefix(es), $_n50 at or above \$0.50/min, worst \$$LRN_WORST/min"
+  info "LRN blocklist: $LRN_COUNT prefix(es), $LRN_N50 at or above \$0.50/min, worst \$$LRN_WORST/min"
 else
   {
     echo "; blocklist.csv held no usable rows. Nothing is blocked by rate."
@@ -632,6 +689,11 @@ declare -A R=(
   [DIAL_TIMEOUT]="$DIAL_TIMEOUT"
   [FRACTEL_GW_COUNT]="$FRACTEL_GW_COUNT"
   [DID_DAILY_CAP]="$DID_DAILY_CAP"
+  [TRANSFER_DETECT]="$TRANSFER_DETECT"
+  [SBC_TF_NPAS]="$SBC_TF_NPAS"
+  [TRANSFER_MIN_CALLS]="$TRANSFER_MIN_CALLS"
+  [TRANSFER_MIN_ACD]="$TRANSFER_MIN_ACD"
+  [TRANSFER_EXPIRE_DAYS]="$TRANSFER_EXPIRE_DAYS"
   [DID_TOTAL]="$DID_TOTAL"
   [DID_NPA_POOLS]="$DID_NPA_POOLS"
   [OVERFLOW_COUNT]="$OVERFLOW_COUNT"

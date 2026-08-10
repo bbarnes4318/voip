@@ -12,6 +12,31 @@
 #   ./didctl.sh set <did> <n>       force a count. TEST TOOL — see below.
 #   ./didctl.sh reset <did>|--all   zero today's counts. Needs --force.
 #
+#   ./didctl.sh transfers list      learned transfer destinations, counts, ACD
+#   ./didctl.sh transfers add <n>   pin a destination as a transfer leg
+#   ./didctl.sh transfers remove <n>   unpin AND suppress re-learning
+#   ./didctl.sh transfers stats     transfer legs vs prospect dials, last 24h
+#   ./didctl.sh transfers reset     forget everything learned. Needs --force.
+#
+# TRANSFER STATE lives under
+#
+#     sbc/xfer/<customer endpoint>/<destination>
+#
+# as <flag>:<answered>:<billsec>:<lastseen>, one key per destination so
+# detection in the call path costs a single read.
+#
+#   L  learning or learned — flagged once answered >= TRANSFER_MIN_CALLS and
+#      billsec/answered > TRANSFER_MIN_ACD
+#   P  pinned by `transfers add` — always a transfer leg
+#   S  suppressed by `transfers remove` — never one, and never re-learned
+#
+# Per endpoint, not global: two customers dialling the same number are not
+# evidence about each other.
+#
+# Unlike the DID counters these are NOT date-keyed and do NOT reset at
+# midnight — the whole point is that a buyer line stays recognised. They are
+# expired by inactivity instead (`prune`), and only flag L is ever expired.
+#
 # Counters live in the Asterisk database under
 #
 #     sbc/didcnt/<YYYYMMDD>/<did>
@@ -41,6 +66,9 @@ AST="${AST:-asterisk}"
 
 DID_DAILY_CAP="${DID_DAILY_CAP:-200}"
 CDR_CSV_PATH="${CDR_CSV_PATH:-/var/log/asterisk/cdr-custom/sbc.csv}"
+TRANSFER_MIN_CALLS="${TRANSFER_MIN_CALLS:-3}"
+TRANSFER_MIN_ACD="${TRANSFER_MIN_ACD:-60}"
+TRANSFER_EXPIRE_DAYS="${TRANSFER_EXPIRE_DAYS:-30}"
 TODAY="$(date '+%Y%m%d')"
 
 B=$'\033[1m'; D=$'\033[2m'; R=$'\033[31m'; Y=$'\033[33m'; G=$'\033[32m'; N=$'\033[0m'
@@ -63,6 +91,36 @@ db_show() { "$AST" -rx "database show $1" 2>/dev/null | awk -F':' '/^\// {
 
 # Counts for one day, emitted as "<did> <count>".
 day_counts() { db_show "sbc/didcnt/$1" | awk -F'\t' '{n=split($1,p,"/"); print p[n], $2}'; }
+
+# Transfer state, emitted as "<endpoint> <dest> <flag> <answered> <billsec> <lastseen>".
+xfer_rows() {
+  db_show "sbc/xfer" | awk -F'\t' '{
+    n=split($1,p,"/"); dest=p[n]; ep=p[n-1]
+    split($2,v,":")
+    if (dest=="" || v[1]=="") next
+    print ep, dest, v[1], v[2]+0, v[3]+0, v[4]
+  }'
+}
+
+# Customer endpoints, from the running config. A buyer number is a buyer
+# number whichever customer IP reached it, so pin and suppress apply to all of
+# them unless --ep narrows it.
+xfer_endpoints() {
+  local eps
+  eps="$("$AST" -rx "pjsip show endpoints" 2>/dev/null | grep -oE 'pkclient[0-9]+' | sort -u)"
+  [[ -n "$eps" ]] && { echo "$eps"; return; }
+  printf 'pkclient1\npkclient2\n'
+}
+
+# Is this row currently treated as a transfer destination?
+xfer_active() { # xfer_active <flag> <answered> <billsec>
+  case "$1" in
+    P) echo yes; return ;;
+    S) echo no;  return ;;
+  esac
+  awk -v n="$2" -v b="$3" -v mc="$TRANSFER_MIN_CALLS" -v ma="$TRANSFER_MIN_ACD" \
+    'BEGIN{ print (n>=mc && n>0 && b/n>ma) ? "yes" : "no" }'
+}
 
 # ---------------------------------------------------------------------------
 # The CDR is CSV_QUOTE'd and caller ID is attacker-controlled text that will
@@ -287,6 +345,31 @@ prune)
     fi
   done
   echo "  pruned $n day(s) older than $CUTOFF; kept $DAYS day(s) of history"
+
+  # --- learned transfer destinations ---------------------------------------
+  # Expired by INACTIVITY, not by date-keying: a buyer line has to stay
+  # recognised across days or the first calls of every morning would go out
+  # with a pool DID.
+  #
+  # Only flag L is expired. P (pinned) and S (suppressed) are deliberate
+  # operator decisions and outliving a quiet month is exactly what they are
+  # for — expiring an S would let the destination be re-learned, silently
+  # undoing a `transfers remove`.
+  XCUT="$(date -d "-$TRANSFER_EXPIRE_DAYS day" '+%Y%m%d' 2>/dev/null \
+          || date -v-"${TRANSFER_EXPIRE_DAYS}"d '+%Y%m%d' 2>/dev/null)"
+  if [[ -n "$XCUT" ]]; then
+    x=0; kept=0
+    while read -r ep dest flag n b seen; do
+      [[ -n "$dest" ]] || continue
+      if [[ "$flag" != "L" ]]; then kept=$((kept + 1)); continue; fi
+      if [[ ! "$seen" =~ ^[0-9]{8}$ ]] || [[ "$seen" < "$XCUT" ]]; then
+        "$AST" -rx "database del sbc/xfer/$ep $dest" >/dev/null 2>&1
+        echo "  forgot   $ep/$dest (last seen ${seen:-never})"
+        x=$((x + 1))
+      fi
+    done <<< "$(xfer_rows)"
+    echo "  expired $x learned transfer destination(s) idle since before $XCUT; kept $kept pinned/suppressed"
+  fi
   ;;
 
 # ---------------------------------------------------------------------------
@@ -333,6 +416,131 @@ reset)
     "$AST" -rx "database del sbc/didcnt/$TODAY $DID" >/dev/null 2>&1
     echo "  cleared sbc/didcnt/$TODAY/$DID"
   fi
+  ;;
+
+# ---------------------------------------------------------------------------
+transfers)
+  need_ast
+  case "${2:-list}" in
+
+  list)
+    ROWS="$(xfer_rows)"
+    echo
+    echo "  ${B}transfer destinations${N}   flagged at >=${TRANSFER_MIN_CALLS} answered AND ACD >${TRANSFER_MIN_ACD}s"
+    echo
+    if [[ -z "$ROWS" ]]; then
+      echo "  ${D}nothing tracked yet${N}"
+      echo
+      echo "  ${D}A destination is only tracked once it has produced one answered${N}"
+      echo "  ${D}call longer than ${TRANSFER_MIN_ACD}s. Toll-free destinations are detected${N}"
+      echo "  ${D}statelessly by rule 1 and never appear here.${N}"
+      echo
+      exit 0
+    fi
+    printf '    %-11s %-13s %-4s %8s %9s %7s %-9s %s\n' \
+           endpoint destination flag answered billsec acd lastseen active
+    while read -r ep dest flag n b seen; do
+      [[ -n "$dest" ]] || continue
+      acd=$(awk -v n="$n" -v b="$b" 'BEGIN{printf "%d", (n>0? b/n : 0)}')
+      act="$(xfer_active "$flag" "$n" "$b")"
+      col="$N"; [[ "$act" == "yes" ]] && col="$G"
+      [[ "$flag" == "S" ]] && col="$D"
+      printf '    %s%-11s %-13s %-4s %8s %9s %7s %-9s %s%s\n' \
+             "$col" "$ep" "$dest" "$flag" "$n" "$b" "$acd" "$seen" "$act" "$N"
+    done <<< "$ROWS"
+    echo
+    echo "    ${D}L learning/learned   P pinned by hand   S suppressed by hand${N}"
+    echo
+    ;;
+
+  add)
+    DEST="$(printf '%s' "${3:-}" | tr -cd '0-9')"
+    [[ -n "$DEST" ]] || die "usage: didctl.sh transfers add <number> [--ep <endpoint>]"
+    (( ${#DEST} == 10 )) && DEST="1$DEST"
+    EPS="$(xfer_endpoints)"
+    if [[ "${4:-}" == "--ep" && -n "${5:-}" ]]; then EPS="$5"; fi
+    for ep in $EPS; do
+      "$AST" -rx "database put sbc/xfer/$ep $DEST P:0:0:$TODAY" >/dev/null 2>&1 \
+        || die "database put failed for $ep"
+      echo "  pinned   $ep/$DEST"
+    done
+    echo
+    echo "  ${D}Calls to $DEST now pass the customer's caller ID through${N}"
+    echo "  ${D}unchanged and consume no DID. Pinned entries never expire.${N}"
+    ;;
+
+  remove)
+    DEST="$(printf '%s' "${3:-}" | tr -cd '0-9')"
+    [[ -n "$DEST" ]] || die "usage: didctl.sh transfers remove <number> [--ep <endpoint>]"
+    (( ${#DEST} == 10 )) && DEST="1$DEST"
+    EPS="$(xfer_endpoints)"
+    if [[ "${4:-}" == "--ep" && -n "${5:-}" ]]; then EPS="$5"; fi
+    for ep in $EPS; do
+      # Suppress rather than delete. A plain delete would let the next three
+      # answered calls re-learn the destination and silently undo this.
+      "$AST" -rx "database put sbc/xfer/$ep $DEST S:0:0:$TODAY" >/dev/null 2>&1 \
+        || die "database put failed for $ep"
+      echo "  suppressed   $ep/$DEST"
+    done
+    echo
+    echo "  ${D}Calls to $DEST get the full caller ID rewrite again, and the${N}"
+    echo "  ${D}destination will NOT be re-learned. Suppression never expires;${N}"
+    echo "  ${D}clear it with: asterisk -rx \"database del sbc/xfer/<ep> $DEST\"${N}"
+    ;;
+
+  stats)
+    HRS="${3:-24}"
+    [[ -r "$CDR_CSV_PATH" ]] || die "cannot read $CDR_CSV_PATH"
+    CUT_TS="$(date -d "-$HRS hour" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+              || date -v-"${HRS}"H '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+    echo
+    echo "  ${B}transfer legs vs prospect dials${N}   last ${HRS}h   ${D}from $CDR_CSV_PATH${N}"
+    echo
+    tail -n 200000 "$CDR_CSV_PATH" 2>/dev/null | awk -v cutoff="$CUT_TS" "$CSVSPLIT"'
+      { n=csvsplit($0,f); if (n<19) next
+        if (cutoff!="" && f[1] < cutoff) next
+        r=f[17]
+        if (r=="")                        cls="(refused before selection)"
+        else if (r ~ /^transfer_leg_/)  { cls=r; xfer++ }
+        else                            { cls=r; pros++ }
+        c[cls]++; t++
+        if (f[10]=="ANSWERED") { ans[cls]++; bs[cls]+=f[9]+0 }
+      }
+      END {
+        if (t==0) { print "    no rows in window"; exit }
+        for (k in c)
+          printf "    %-28s %7d  %5.1f%%   answered %6d   acd %5.0fs\n",
+                 k, c[k], 100*c[k]/t, ans[k]+0, (ans[k]>0 ? bs[k]/ans[k] : 0)
+        printf "\n    %-28s %7d  %5.1f%%\n", "TRANSFER LEGS", xfer+0, 100*(xfer+0)/t
+        printf "    %-28s %7d  %5.1f%%\n",   "prospect dials", pros+0, 100*(pros+0)/t
+        printf "    %-28s %7d\n",            "total rows", t
+      }' | sort
+    echo
+    echo "  ${D}A transfer-leg share far above a few tenths of a percent means${N}"
+    echo "  ${D}rule 2 is over-firing: prospect dials are keeping the customer's${N}"
+    echo "  ${D}caller ID instead of ours. Check 'transfers list'.${N}"
+    echo
+    ;;
+
+  reset)
+    [[ "${3:-}" == "--force" || "${SBC_FORCE:-}" == "1" ]] || die \
+"refusing without --force.
+
+       This forgets every learned transfer destination AND every manual pin
+       and suppression. Buyer lines then take ${TRANSFER_MIN_CALLS} answered calls each to
+       re-learn, and during that window their transfers go out with a pool
+       DID — the buyer sees a stranger.
+
+       didctl.sh transfers reset --force"
+    "$AST" -rx "database deltree sbc/xfer" >/dev/null 2>&1
+    echo "  cleared all transfer state"
+    ;;
+
+  *)
+    echo "usage: didctl.sh transfers list|add <n>|remove <n>|stats [hours]|reset" >&2
+    exit 2
+    ;;
+  esac
   ;;
 
 # ---------------------------------------------------------------------------

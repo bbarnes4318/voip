@@ -77,6 +77,10 @@ SBC_NORMALIZE_CID=@@NORMALIZE_CALLERID@@
 SBC_DIAL_TIMEOUT=@@DIAL_TIMEOUT@@
 SBC_GW_COUNT=@@FRACTEL_GW_COUNT@@
 SBC_DID_CAP=@@DID_DAILY_CAP@@
+SBC_XFER_ON=@@TRANSFER_DETECT@@
+SBC_XFER_TF_NPAS=@@SBC_TF_NPAS@@
+SBC_XFER_MIN_CALLS=@@TRANSFER_MIN_CALLS@@
+SBC_XFER_MIN_ACD=@@TRANSFER_MIN_ACD@@
 @@INCLUDE:fractel_globals@@
 
 ; --- DID pools, generated from dids.csv ------------------------------------
@@ -300,15 +304,92 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  same => n,Set(SBC_CCNOW=${GROUP_COUNT(${SBC_EP}@cust)})
  same => n,GotoIf($[${SBC_CCNOW} > ${SBC_MAX_CONCURRENT}]?rej_cap)
 
- ; ---- 7. DID selection and per-DID daily cap -----------------------------
+ ; ---- 7. transfer-leg detection ------------------------------------------
+ ; A transfer leg is an agent bridging a live prospect to the US buyer. The
+ ; buyer has to see the PROSPECT's number — it is their callback path and
+ ; their CRM record — and ViciDial already sets it correctly on those legs.
+ ; Rewriting it would show the buyer a stranger.
+ ;
+ ; Detection is on the DESTINATION and never on caller ID. The customer sends
+ ; arbitrary caller ID on every call, which is the entire reason this SBC
+ ; exists; a caller-ID-based rule would be defeated by exactly the
+ ; misconfiguration it has to survive.
+ ;
+ ; This runs after the destination checks, so the NANP allowlist, the NPA
+ ; denylist and the high-cost blocklist have already had their say. A transfer
+ ; leg is not a trusted call — it is a call whose caller ID we do not own.
+ same => n,Set(SBC_DAY=${STRFTIME(${EPOCH},,%Y%m%d)})
+ same => n,Set(SBC_XFER=)
+ same => n,GotoIf($["${SBC_XFER_ON}" != "true"]?xfer_no)
+
+ ; --- rule 1: toll-free destination ---------------------------------------
+ ; Stateless and immediate, and it runs before any database read. Consumer
+ ; prospects are never toll-free.
+ same => n,GotoIf($["${SBC_XFER_TF_NPAS}" : ".*,${SBC_NPA},"]?xfer_tollfree)
+
+ ; --- rule 2: learned destination -----------------------------------------
+ ; ONE database read, and only ever a read. The counters behind it are
+ ; written in the hangup handler at the bottom of this context, so learning
+ ; can never add post-dial delay.
+ ;
+ ; Value format is <flag>:<answered>:<billsec>:<lastseen>, one key rather than
+ ; three so this costs a single lookup:
+ ;   L  learning or learned  — evaluated against the thresholds below
+ ;   P  pinned by an operator (didctl transfers add)  — always a transfer leg
+ ;   S  suppressed by an operator (didctl transfers remove) — never one, and
+ ;      never re-learned
+ same => n,Set(SBC_XF=${DB(sbc/xfer/${SBC_EP}/${SBC_DEST})})
+ same => n,GotoIf($["${SBC_XF}" = ""]?xfer_no)
+ same => n,Set(SBC_XF_FLAG=${CUT(SBC_XF,:,1)})
+ same => n,GotoIf($["${SBC_XF_FLAG}" = "S"]?xfer_no)
+ same => n,GotoIf($["${SBC_XF_FLAG}" = "P"]?xfer_pinned)
+ same => n,Set(SBC_XF_N=${CUT(SBC_XF,:,2)})
+ same => n,Set(SBC_XF_B=${CUT(SBC_XF,:,3)})
+ ; Both conditions, not either. Count alone flags any repeatedly-dialled
+ ; prospect; duration alone flags a single long conversation.
+ same => n,GotoIf($[${SBC_XF_N} < ${SBC_XFER_MIN_CALLS}]?xfer_no)
+ same => n,GotoIf($[( ${SBC_XF_B} / ${SBC_XF_N} ) <= ${SBC_XFER_MIN_ACD}]?xfer_no)
+ same => n,Set(SBC_XFER=transfer_leg_learned)
+ same => n,Goto(xfer_yes)
+
+ same => n(xfer_pinned),Set(SBC_XFER=transfer_leg_pinned)
+ same => n,Goto(xfer_yes)
+ same => n(xfer_tollfree),Set(SBC_XFER=transfer_leg_tollfree)
+
+ ; --- this is a transfer leg ----------------------------------------------
+ ; Do NOT touch CALLERID. The customer's value is already in it, and leaving
+ ; it alone is what puts their number in From. P-Asserted-Identity and
+ ; Remote-Party-ID are generated from the same CALLERID by res_pjsip, so all
+ ; three carry it without a single assignment here.
+ same => n(xfer_yes),GotoIf($["${SBC_CID_OK}" != "1"]?xfer_badcid)
+ ; ANI feeds Remote-Party-ID and is not guaranteed to have been populated from
+ ; From. Pin it explicitly so RPID cannot disagree with the other two.
+ same => n,Set(CALLERID(ANI)=${CALLERID(num)})
+ same => n,Set(CDR(did_selection_reason)=${SBC_XFER})
+ same => n,Set(CDR(did_daily_count_at_selection)=)
+ same => n,Log(NOTICE,SBC-TRANSFER-LEG callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} dst=${SBC_DEST} cid=${CALLERID(num)} rule=${SBC_XFER} note=customer-cid-passed-through-no-did-consumed)
+ same => n,Goto(dial)
+
+ ; The customer's caller ID is the whole point of a transfer leg, and this one
+ ; is unusable — empty, alphabetic, wrong length or self-dialled. Asserting it
+ ; risks a rejected INVITE or an unanswerable traceback with our name on it.
+ ;
+ ; So fall through to the normal rewrite. The buyer sees a pool DID, which is
+ ; wrong but working; the alternative is a failed transfer with a live
+ ; prospect on the line. Loud, because it means the customer's dialer is
+ ; broken on the leg where caller ID matters most.
+ same => n(xfer_badcid),Set(SBC_XFER=)
+ same => n,Log(WARNING,SBC-TRANSFER-BADCID callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} dst=${SBC_DEST} custcid=${SBC_CID_RAW} note=transfer-leg-with-unusable-cid-falling-back-to-pool-did)
+
+ ; ---- 8. DID selection and per-DID daily cap -----------------------------
  ; Runs AFTER the CPS and concurrency checks on purpose: a call that is about
- ; to be throttled must not consume a number's daily allowance first.
+ ; to be throttled must not consume a number's daily allowance first. Transfer
+ ; legs never reach here at all — they consume no DID and no daily allowance.
  ;
  ; Counters are keyed by local date, so midnight rollover happens for free —
  ; there is no reset job that can fail and no race at the boundary. See
  ; [sbc-did] at the bottom of this file for the selection itself.
- same => n,Set(SBC_DAY=${STRFTIME(${EPOCH},,%Y%m%d)})
- same => n,Set(SBC_DID=)
+ same => n(xfer_no),Set(SBC_DID=)
  same => n,Set(SBC_DID_COUNT=)
  same => n,Set(SBC_DID_REASON=npa_match)
  same => n,Gosub(sbc-did,pick,1(${SBC_NPA},${GLOBAL(SBC_DID_POOL_${SBC_NPA})},${GLOBAL(SBC_DID_CNT_${SBC_NPA})}))
@@ -322,7 +403,7 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  same => n,GotoIf($["${SBC_DID}" = ""]?rej_nodid)
  same => n,Log(WARNING,SBC-DID-OVERFLOW callid=${SBC_CALLID} dst_npa=${SBC_NPA} dst=${SBC_DEST} did=${SBC_DID} count=${SBC_DID_COUNT} cap=${SBC_DID_CAP} note=no-pool-or-pool-exhausted)
 
- ; ---- 8. caller ID is SET here, and nowhere else -------------------------
+ ; ---- 8b. caller ID is SET here, and nowhere else ------------------------
  ; Validate our own selection before asserting it. A malformed DID reaching
  ; FracTEL is worse than a refused call: it is an unanswerable traceback with
  ; our name on it. This is the guard that makes a customer-supplied CID
@@ -359,14 +440,14 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  ; The rotor is an in-memory global incremented once per call: no lock, no
  ; disk write, and correct for any gateway count. On failure the ring is
  ; walked from wherever this call started.
- same => n,Set(SBC_TRY=0)
+ same => n(dial),Set(SBC_TRY=0)
  same => n,Set(SBC_GWROT=$[${IF($["${GLOBAL(SBC_GW_ROT)}" != ""]?${GLOBAL(SBC_GW_ROT)}:0)} + 1])
  same => n,Set(GLOBAL(SBC_GW_ROT)=${SBC_GWROT})
  same => n,Set(SBC_GWIDX=$[( ${SBC_GWROT} % ${SBC_GW_COUNT} ) + 1])
 
  same => n(gwloop),Set(SBC_GW=${GLOBAL(FRACTEL_GW_${SBC_GWIDX})})
  same => n,Set(CDR(fractel_gateway_used)=${SBC_GW})
- same => n,Log(NOTICE,SBC-DIAL callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} custcid=${SBC_CID_RAW} did=${SBC_DID} didreason=${SBC_DID_REASON} didcount=${SBC_DID_COUNT} dst=${SBC_DEST} gw=${SBC_GW} attempt=${SBC_TRY})
+ same => n,Log(NOTICE,SBC-DIAL callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} custcid=${SBC_CID_RAW} did=${SBC_DID} didreason=${SBC_DID_REASON} didcount=${SBC_DID_COUNT} xfer=${SBC_XFER} asserted=${CALLERID(num)} dst=${SBC_DEST} gw=${SBC_GW} attempt=${SBC_TRY})
  ; No Dial() options at all. No t/T (no transfer), no g/G, no M/L. The only
  ; thing this leg can do is connect two RTP streams through this box.
  same => n,Dial(PJSIP/${SBC_DEST}@${SBC_GW},${SBC_DIAL_TIMEOUT})
@@ -452,7 +533,55 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
 ; cdr.conf sets endbeforehexten=no, so CDR() assignments made here still land
 ; in the written row. This is where hangup_cause gets recorded.
 exten => h,1,Set(CDR(hangup_cause)=${HANGUPCAUSE})
- same => n,NoOp(SBC-END callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} dst=${SBC_DEST} did=${SBC_DID} disp=${CDR(disposition)} billsec=${CDR(billsec)} gw=${CDR(fractel_gateway_used)} reject=${CDR(reject_reason)})
+ same => n,NoOp(SBC-END callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} dst=${SBC_DEST} did=${SBC_DID} xfer=${SBC_XFER} disp=${CDR(disposition)} billsec=${CDR(billsec)} gw=${CDR(fractel_gateway_used)} reject=${CDR(reject_reason)})
+
+ ; --- transfer-leg learning ------------------------------------------------
+ ; EVERY counter write for rule 2 happens here and nowhere else. Detection in
+ ; the call path is read-only, so no amount of learning can add post-dial
+ ; delay. The channel is already being torn down; nothing is waiting on this.
+ ;
+ ; Per customer endpoint, not global: two customers dialling the same number
+ ; are not evidence about each other, and one customer's traffic pattern must
+ ; not silently change how another's caller ID is treated.
+ same => n,GotoIf($["${SBC_XFER_ON}" != "true"]?hdone)
+ same => n,GotoIf($["${CDR(disposition)}" != "ANSWERED"]?hdone)
+ same => n,GotoIf($["${SBC_DEST}" = ""]?hdone)
+ same => n,GotoIf($["${SBC_EP}" = ""]?hdone)
+ same => n,Set(SBC_H_BS=${CDR(billsec)})
+ same => n,GotoIf($[${SBC_H_BS} < 1]?hdone)
+
+ same => n,Set(SBC_H_KEY=sbc/xfer/${SBC_EP}/${SBC_DEST})
+ same => n,Set(SBC_H_CUR=${DB(${SBC_H_KEY})})
+ same => n,GotoIf($["${SBC_H_CUR}" != ""]?h_have)
+
+ ; Nothing stored yet. Only START tracking a destination once it has produced
+ ; one answered call longer than the ACD threshold. Traffic reaches roughly
+ ; 42,000 unique destinations a day and only about 80 ever produce a call over
+ ; a minute — tracking the rest would add 20,000+ database writes a day for
+ ; numbers that can never qualify.
+ same => n,GotoIf($[${SBC_H_BS} <= ${SBC_XFER_MIN_ACD}]?hdone)
+ same => n,Set(SBC_H_CUR=L:0:0:0)
+
+ same => n(h_have),Set(SBC_H_FLAG=${CUT(SBC_H_CUR,:,1)})
+ ; A destination an operator explicitly unpinned is never re-learned. Without
+ ; this, `didctl transfers remove` would be undone by the next three calls.
+ same => n,GotoIf($["${SBC_H_FLAG}" = "S"]?hdone)
+
+ ; Read-modify-write, so it takes the same per-key lock discipline as the DID
+ ; counters — but only one attempt. Two calls to the SAME destination ending
+ ; in the same instant is rare, and losing that race costs one count, which
+ ; delays learning by a single call. Retrying here would hold a channel open
+ ; during teardown for no benefit.
+ same => n,Set(SBC_H_LOCK=${TRYLOCK(xfer_${SBC_EP}_${SBC_DEST})})
+ same => n,Set(SBC_H_N=$[${CUT(SBC_H_CUR,:,2)} + 1])
+ same => n,Set(SBC_H_B=$[${CUT(SBC_H_CUR,:,3)} + ${SBC_H_BS}])
+ ; lastseen is refreshed on every answered call, including for pinned and
+ ; already-learned destinations, so an active buyer line never expires.
+ same => n,Set(DB(${SBC_H_KEY})=${SBC_H_FLAG}:${SBC_H_N}:${SBC_H_B}:${STRFTIME(${EPOCH},,%Y%m%d)})
+ same => n,ExecIf($["${SBC_H_LOCK}" = "1"]?Set(SBC_H_REL=${UNLOCK(xfer_${SBC_EP}_${SBC_DEST})}))
+ same => n,NoOp(SBC-XFER-LEARN ep=${SBC_EP} dst=${SBC_DEST} flag=${SBC_H_FLAG} answered=${SBC_H_N} billsec=${SBC_H_B} acd=$[${SBC_H_B} / ${SBC_H_N}])
+
+ same => n(hdone),NoOp(teardown complete)
 
 
 ; ===========================================================================

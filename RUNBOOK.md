@@ -404,6 +404,59 @@ prevent — prefer adding numbers. `didctl.sh reset` exists but zeroing counters
 mid-day lets every number carry another full allowance on top of what it has
 already sent, so it is a deliberate act and it requires `--force`.
 
+### Transfer legs
+
+**Are transfers being detected at all** — the number to watch is the transfer
+share. On this traffic it should be a fraction of a percent (15–30 legs out of
+~53,000 calls):
+
+```bash
+./didctl.sh transfers stats
+```
+
+**What has been learned:**
+
+```bash
+./didctl.sh transfers list
+```
+
+**"The buyer says they're seeing a strange number."** That is a transfer leg
+that was not detected — it went out as a prospect dial with a pool DID. Find
+it, confirm, then pin the buyer number so it never happens again:
+
+```bash
+grep 'SBC-DIAL' /var/log/asterisk/messages | grep 'dst=<BUYER_NUMBER>' | tail -5
+```
+
+```bash
+./didctl.sh transfers add <BUYER_NUMBER>
+```
+
+Pinning takes effect on the next call and never expires. This is also the fix
+for the accepted warm-up cost: a new non-toll-free buyer needs three answered
+calls before rule 2 fires, and pinning skips it entirely.
+
+**"A prospect got our customer's caller ID instead of ours."** The reverse —
+rule 2 has over-fired on a destination that is not a buyer. Un-flag it:
+
+```bash
+./didctl.sh transfers remove <NUMBER>
+```
+
+That suppresses it permanently rather than deleting the counters, so the next
+three calls cannot silently re-learn it. If this happens more than once,
+`TRANSFER_MIN_CALLS` is too low — it should be 3 and never lower.
+
+**Transfer state is not date-keyed and does not reset at midnight.** That is
+deliberate: a buyer line has to stay recognised across days. Learned entries
+expire after `TRANSFER_EXPIRE_DAYS` of inactivity, handled by the weekly
+prune timer. Pins and suppressions never expire.
+
+Do **not** run `transfers reset` on a live box to "clear something up" — every
+buyer line then needs three answered calls to re-learn, and during that window
+their transfers go out with a pool DID. Use `transfers remove` on the one
+destination instead.
+
 **Find one call** (for a traceback, or a customer complaint):
 
 ```bash
@@ -455,6 +508,17 @@ before you paste it.
 | 15 | Destination NPA with no pool selects from overflow and logs WARN | NPA 505 | not captured |
 | 16 | Blocklisted prefix refused with 503, longest prefix wins | `destinations-blocked.csv` | not captured |
 | 17 | 600+ calls spread across all six gateways | from the CDR alone | not captured |
+| 18 | 844 destination: customer CID intact in all three headers, no pool DID, tagged `transfer_leg_tollfree` | SIPp + stub `-trace_msg` | not captured |
+| 19 | Same destination 3× answered over the ACD threshold; the 4th is tagged `transfer_leg_learned` and passes CID through | SIPp + log scan | not captured |
+| 20 | Same destination 5× answered *below* the threshold: NOT flagged, full rewrite | guards the ACD condition | not captured |
+| 21 | Destination dialled twice, both long: NOT flagged | guards the `>=3` count | not captured |
+| 22 | Toll-free *and* blocklisted destination still refused with 503 | ordering test | not captured |
+| 23 | `didctl.sh transfers remove` un-flags, and 3 more long calls do not re-learn it | suppression, not deletion | not captured |
+
+Criteria 18–23 run with `TRANSFER_MIN_ACD` scaled to 3 seconds so the suite
+does not spend four and a half minutes waiting on 90-second calls.
+`TRANSFER_MIN_CALLS` stays at 3 — that is the validated value and criteria 19
+and 21 exist to prove the boundary either side of it.
 
 Criteria 13 and 17 are measured from the same 1000-call run — two questions
 about one mechanism. Criterion 17's important half is **all six** gateways
@@ -589,6 +653,40 @@ anything here. **Confirm it on the first live call rather than assuming it** —
 and do not treat B as a fault until you have checked that the numbers in
 `dids.csv` are provisioned to this subaccount. B on a DID they have not
 associated with you is a provisioning gap, not a signing bug.
+
+### Transfer detection against real traffic
+
+The suite proves the state machine reaches the right states. It cannot tell
+you whether the rules match *your customer's actual buyers*, because the stub
+answers anything and the fixtures are invented.
+
+Rule 1 needs no validation — toll-free is toll-free. Rule 2 does. On the first
+full production day:
+
+```bash
+./didctl.sh transfers stats
+```
+
+```bash
+./didctl.sh transfers list
+```
+
+Two failure modes, opposite directions, and both are visible here:
+
+**Over-firing** — the transfer share is more than a fraction of a percent, or
+`transfers list` shows destinations that are obviously consumer numbers. Every
+false positive is a prospect dial that kept the customer's caller ID instead
+of ours, which is the failure this whole build exists to prevent, arriving
+through the back door. Remove them individually and check `TRANSFER_MIN_CALLS`
+is still 3.
+
+**Under-firing** — buyers report seeing unfamiliar numbers. Those transfers
+went out with a pool DID. Expected for the first three calls to a new
+non-toll-free buyer; not expected after that. Pin the number.
+
+You will not get a buyer list from the customer — the call centres are two or
+three steps removed — so `transfers list` after a day of real traffic is the
+closest thing to one you will have. Read it.
 
 ### The blocklist misses ported numbers
 

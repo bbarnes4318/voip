@@ -38,9 +38,23 @@
 ;
 ;   16  selected_did            the DID this SBC asserted, 11 digits. This is
 ;                               what went out in From, P-Asserted-Identity and
-;                               Remote-Party-ID. Empty only on a call refused
-;                               before selection.
+;                               Remote-Party-ID.
+;                               EMPTY on a call refused before selection, and
+;                               EMPTY on a transfer leg — where no DID was
+;                               drawn and the number asserted is the one in
+;                               caller_id (column 6). Read column 17 to tell
+;                               those two cases apart.
 ;   17  did_selection_reason    npa_match | overflow | none
+;                               transfer_leg_tollfree   rule 1, destination NPA
+;                               transfer_leg_learned    rule 2, >=N answered
+;                                                       calls with a high ACD
+;                               transfer_leg_pinned     didctl transfers add
+;
+;                               The three transfer_leg_* values mean the
+;                               customer's caller ID was passed through
+;                               UNCHANGED and no daily allowance was consumed.
+;                               On those rows, caller_id (6) is what FracTEL
+;                               saw and selected_did (16) is empty.
 ;   18  destination_npa         3-digit NPA of the number dialled
 ;   19  did_daily_count_at_selection
 ;                               that DID's call count for the day INCLUDING

@@ -15,10 +15,19 @@
 #                       shorter pattern this is where it would show.
 #   1701                4 digits, a whole NPA. Variable-length prefixes have
 #                       to work or the deck's NPA-wide rows are ignored.
+#   1855555             TOLL-FREE and blocklisted, for criterion 22. NPA 855
+#                       is in TRANSFER_TOLLFREE_NPAS, so rule 1 would call
+#                       this a transfer leg — but the blocklist runs first and
+#                       has to win. A transfer leg is not a trusted call, it
+#                       is a call whose caller ID we do not own.
 #
 # None of these NPAs appear in dids.test.csv, and none are in BLOCKED_NPAS,
 # so a rejection here is unambiguously the blocklist doing it rather than the
 # NANP allowlist or the high-risk NPA denylist getting there first.
+#
+# Note 855 is excluded from build-blocklist.py's CONUS scope, so a real
+# generated blocklist would never contain a toll-free row. This one is here
+# by hand precisely to prove the ordering holds if one ever did.
 # ===========================================================================
 prefix,rate_per_min,destination
 1252555,3.140000,NC-252 TEST
@@ -26,3 +35,4 @@ prefix,rate_per_min,destination
 1712555,0.270000,IA-712 TEST SHORT
 1712555012,1.410000,IA-712 TEST LONGEST MATCH
 1701,0.180000,ND-701 TEST NPA WIDE
+1855555,4.200000,TOLL-FREE AND BLOCKED TEST

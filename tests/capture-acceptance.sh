@@ -127,6 +127,12 @@ emit "Criterion 14 — per-DID daily cap and today's usage" \
      bash -c "$ROOT/didctl.sh status"
 emit "Criterion 16 — high-cost prefixes loaded" \
      bash -c "asterisk -rx 'dialplan show sbc-lrn-blocklist' | tail -3"
+emit "Criteria 18-23 — transfer-leg detection settings" \
+     bash -c "asterisk -rx 'dialplan show globals' | grep -E '^SBC_XFER'"
+emit "Criteria 19-21 — learned transfer destinations" \
+     bash -c "$ROOT/didctl.sh transfers list"
+emit "Criteria 18-23 — transfer legs vs prospect dials" \
+     bash -c "$ROOT/didctl.sh transfers stats"
 emit "Dialplan functions the DID logic depends on" \
      bash -c "for f in LOCK TRYLOCK UNLOCK DB DIALPLAN_EXISTS; do printf '%-16s ' \$f; asterisk -rx \"core show function \$f\" >/dev/null 2>&1 && echo present || echo MISSING; done"
 emit "Firewall ruleset (layer 1)" \

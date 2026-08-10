@@ -50,8 +50,9 @@ permitted. No single point of failure.
 | 3 | Dialplan | `[sbc-customer]` in `extensions.conf` | one `Dial()` target, no includes, no `Local/`, and `res_agi`/`app_system`/`func_shell`/`app_originate` are not loaded |
 
 The dialplan checks, in order: killswitch → destination allowlist → high-cost
-prefix blocklist → caller ID (advisory) → CPS → concurrency → **DID selection
-and daily cap** → **caller ID assignment** → dial.
+prefix blocklist → caller ID (advisory) → CPS → concurrency → **transfer-leg
+detection** → **DID selection and daily cap** → **caller ID assignment** →
+dial.
 
 Destination is validated *before* a concurrency slot is consumed, so a flood
 of junk destinations cannot starve legitimate traffic out of the cap. DID
@@ -169,6 +170,85 @@ WARNING SBC-CID-INVALID ... custcid=<what they sent> src=<their IP> note=discard
 
 which is the early warning that their dialer has broken. Setting it `true`
 restores the old 403 rejection; the path is still there.
+
+### Transfer legs are the exception
+
+**The rewrite is correct for prospect dials and wrong for transfer legs.**
+
+When an agent has a live prospect and bridges them to the US buyer, the buyer
+has to see the **prospect's** number — that is their callback path and their
+CRM record. ViciDial already sets caller ID correctly on those legs. Rewriting
+it would show the buyer a stranger.
+
+Detection is on the **destination**, never on caller ID. A caller-ID-based
+rule would be defeated by exactly the misconfiguration this SBC exists to
+survive: the customer sends arbitrary caller ID on every call.
+
+**Rule 1 — toll-free.** Destination NPA in
+`800, 833, 844, 855, 866, 877, 888` → transfer leg. Stateless, immediate, no
+database read, no warm-up. Consumer prospects are never toll-free; a
+53,370-call production day had all 15 of its transfer legs on two 844 numbers.
+
+**Rule 2 — auto-learned.** Per customer endpoint, per destination: once a
+destination has `TRANSFER_MIN_CALLS` (3) answered calls **and** an average
+duration above `TRANSFER_MIN_ACD` (60s), it is a transfer destination from
+then on. Both conditions, not either — count alone flags any repeatedly
+dialled prospect, duration alone flags one long conversation.
+
+3 and 60 were validated against two production CDRs: they flag exactly the one
+real buyer line with zero false positives. A threshold of 2 flags six
+destinations. `render.sh` warns if you go below 3.
+
+On a transfer leg the customer's caller ID passes through **untouched** to all
+three identity headers, no DID is drawn, and no daily cap is consumed. The CDR
+is tagged `transfer_leg_tollfree`, `transfer_leg_learned` or
+`transfer_leg_pinned`, with `selected_did` empty — on those rows the number
+FracTEL saw is in `caller_id`.
+
+**The NANP allowlist, the NPA denylist and the high-cost blocklist all still
+apply.** A transfer leg is not a trusted call; it is a call whose caller ID we
+do not own. Detection runs after those checks, so a blocklisted toll-free
+destination is still refused with 503 (acceptance criterion 22).
+
+Three things about the implementation that are load-bearing:
+
+- **Counters are written only in the hangup handler.** Detection in the call
+  path is a single read. Learning can never add post-dial delay.
+- **A destination is not tracked until one answered call exceeds the ACD
+  threshold.** Traffic reaches ~42,000 unique destinations a day and only
+  ~80 ever produce a call over a minute; tracking the rest would add 20,000+
+  database writes a day for numbers that can never qualify.
+- **State is per customer endpoint.** Two customers dialling the same number
+  are not evidence about each other.
+
+Unlike the DID counters, transfer state is **not** date-keyed and does not
+reset at midnight — a buyer line has to stay recognised, or the first calls of
+every morning would leak. Learned entries expire after
+`TRANSFER_EXPIRE_DAYS` (30) of inactivity. Pins and suppressions never expire.
+
+```bash
+./didctl.sh transfers list
+```
+
+```bash
+./didctl.sh transfers stats
+```
+
+**Known cost, accepted:** the first 3 transfers to a *new non-toll-free* buyer
+go out with a pool DID before rule 2 fires. At 15–30 transfers a day out of
+53,000 calls that is tolerable, and rule 1 catches toll-free buyers with no
+delay at all. Pin a known buyer number to skip the warm-up entirely:
+
+```bash
+./didctl.sh transfers add 17195550101
+```
+
+**One deviation from "pass it through unchanged":** if the customer's caller ID
+on a transfer leg fails the NANP check — empty, alphabetic, wrong length — the
+call falls back to the normal pool-DID rewrite and logs
+`WARNING SBC-TRANSFER-BADCID`. Asserting an unusable number risks a rejected
+INVITE or an unanswerable traceback. The buyer seeing a pool DID is wrong but
+working; a failed transfer with a live prospect on the line is worse.
 
 ### On attestation
 
@@ -361,6 +441,27 @@ outbound leg toward FracTEL), so customer-leg sequence numbers advance by two.
 With six gateways, `seq % 6` yields three residues and **half the trunk goes
 unused**. The trap is that it works correctly with an *odd* gateway count, so
 it would look fine in a five-gateway test and fail on the sixth.
+
+**Transfer detection is on the destination, never on caller ID.** A caller-ID
+rule would be simpler and is the obvious first idea. It is also unusable here:
+the customer sends arbitrary caller ID on every call, which is the reason this
+SBC exists, so any rule keyed on it can be defeated by the exact
+misconfiguration it has to survive. Destination-based detection costs a
+warm-up period on new non-toll-free buyers, and that is the cheaper mistake.
+
+**A transfer leg with an unusable caller ID falls back to the pool DID.** This
+deviates from "pass it through unchanged". Asserting an empty or alphabetic
+From risks a rejected INVITE or a traceback nobody can answer; the buyer
+seeing a pool DID is wrong but working, and a failed transfer with a live
+prospect on the line is worse. Logged at WARNING because it means the
+customer's dialer is broken on the leg where caller ID matters most.
+
+**Transfer state is not date-keyed, unlike the DID counters.** Those are
+date-keyed *so they reset at midnight*. Applying the same pattern here would
+zero the `>=3 answered` accumulator every night, and the first three transfers
+to every buyer would leak every single morning rather than once. Expiry is by
+inactivity instead, and `S` (suppressed) entries never expire — expiring one
+would silently re-learn a destination an operator had explicitly removed.
 
 **`VALIDATE_CALLERID` now defaults to false.** This is the one control that
 was deliberately *loosened*. It stopped being a safety control the moment the

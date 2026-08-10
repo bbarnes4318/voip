@@ -199,3 +199,11 @@ Also changed by the addendum:
   is the primary cost control. The NPA denylist above is now the second layer.
 - Five columns are **appended** to the CDR (16–20). Columns 1–15 keep their
   positions.
+- **Transfer legs are exempt from the rewrite.** When an agent bridges a live
+  prospect to the US buyer, the buyer must see the prospect's number — their
+  callback path and CRM record — and ViciDial already sets it correctly.
+  Detected on the destination (toll-free NPA, or a learned destination with
+  >=3 answered calls and ACD > 60s), never on caller ID. On those calls the
+  customer's caller ID passes through untouched, no DID is drawn and no daily
+  cap is consumed. The NANP allowlist, NPA denylist and blocklist still apply.
+  Acceptance criteria 18–23.
