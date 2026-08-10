@@ -322,19 +322,42 @@ sudo ./killswitch.sh on --hard
 sudo ./killswitch.sh off
 ```
 
-**Change a limit** (caps, NANP toggle, gateway list) — edit `config.env`, then:
+**Change a limit or the DID pool** (caps, NANP toggle, gateway list,
+`dids.csv`) — edit the file, then, **on a box carrying traffic**:
 
 ```bash
-sudo ./install.sh --config-only
+sudo ./render.sh -o /etc/asterisk && sudo ./didctl.sh sync-globals && ./didctl.sh pools
 ```
 
-This re-renders and restarts Asterisk. Calls in progress drop. To change caps
-without dropping calls, set the dialplan global directly and then edit
-`config.env` so the change survives the next render:
+That drops no calls. `install.sh --config-only` also works and is cleaner, but
+it restarts Asterisk and **every call in progress dies** — the `--config-only`
+flag only skips package installation, not the restart. Use it only during a
+drain window (`killswitch.sh on`, wait for channels to reach zero, restart,
+`killswitch.sh off`).
 
-```bash
-sudo asterisk -rx "dialplan set global SBC_MAX_CONCURRENT 100"
-```
+> **`dialplan reload` on its own is NOT enough, and it fails silently.**
+>
+> `extensions.conf` sets `clearglobalvars=no` deliberately — it is what stops a
+> reload wiping the killswitch and quietly restoring customer traffic while you
+> believe the plug is pulled. The cost is that **`dialplan reload` does not
+> apply the `[globals]` section at all**: it neither updates an existing global
+> nor creates a new one.
+>
+> So you can render a new `dids.csv`, run `dialplan reload`, get
+> `Dialplan reloaded.` and exit 0, and have Asterisk still serving the **old**
+> pool. No error, no warning. Measured on the live box during the 172-DID
+> rollout: after render + reload the file had 64 pools and Asterisk had 1.
+>
+> `didctl.sh sync-globals` reads `[globals]` out of the rendered file and
+> applies each changed value with `dialplan set global` — the same runtime
+> mechanism `killswitch.sh` uses. It reads every value back and exits non-zero
+> if the running dialplan still disagrees with the file.
+
+One thing `sync-globals` **cannot** fix: `clearglobalvars=no` also means a
+global for a pool you **deleted** from `dids.csv` survives until a full
+restart, so the box keeps asserting numbers you may no longer own. It detects
+this and exits 2 with the orphaned NPAs listed — clearing them needs a drain
+and restart.
 
 ### The DID pool
 

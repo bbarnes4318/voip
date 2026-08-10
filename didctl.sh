@@ -8,6 +8,9 @@
 #   ./didctl.sh show <did>          one number, today and the days before it
 #   ./didctl.sh pools               the pools the running dialplan actually has
 #   ./didctl.sh distribution [csv]  per-DID / per-NPA / per-gateway, from CDR
+#   ./didctl.sh sync-globals        push rendered [globals] into the RUNNING
+#                                   dialplan. REQUIRED after every render on a
+#                                   live box - see the note in that section.
 #   ./didctl.sh prune [days]        drop counter keys older than <days> (7)
 #   ./didctl.sh set <did> <n>       force a count. TEST TOOL — see below.
 #   ./didctl.sh reset <did>|--all   zero today's counts. Needs --force.
@@ -421,6 +424,80 @@ reset)
     (( ${#DID} == 10 )) && DID="1$DID"
     "$AST" -rx "database del sbc/didcnt/$TODAY $DID" >/dev/null 2>&1
     echo "  cleared sbc/didcnt/$TODAY/$DID"
+  fi
+  ;;
+
+# ---------------------------------------------------------------------------
+sync-globals)
+  need_ast
+  AST_ETC="${AST_ETC:-/etc/asterisk}"
+  CONF_FILE="$AST_ETC/extensions.conf"
+  [[ -r "$CONF_FILE" ]] || die "cannot read $CONF_FILE"
+
+  # WHY THIS EXISTS
+  #
+  # extensions.conf sets clearglobalvars=no, deliberately: it is what stops a
+  # `dialplan reload` silently wiping the killswitch and quietly restoring
+  # customer traffic while the operator believes the plug is pulled.
+  #
+  # The cost is that `dialplan reload` then does NOT apply the [globals]
+  # section at all. It neither updates an existing global nor creates a new
+  # one. Render a new dids.csv, reload, and Asterisk keeps serving the OLD
+  # pool - with no error and no warning. The rendered file and the running
+  # dialplan disagree, and the only visible symptom is that calls keep going
+  # out on numbers you thought you had replaced.
+  #
+  # So: read [globals] out of the rendered file and set each changed value at
+  # runtime, which is the same mechanism killswitch.sh uses. No restart, no
+  # dropped calls. Run this after every render on a box carrying traffic.
+  WANT="$(awk '/^\[globals\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z_][A-Za-z0-9_]*=/{print}' "$CONF_FILE")"
+  [[ -n "$WANT" ]] || die "no [globals] block found in $CONF_FILE"
+
+  HAVE="$("$AST" -rx "dialplan show globals" 2>/dev/null | sed 's/^[[:space:]]*//')"
+  changed=0; same=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    name="${line%%=*}"; val="${line#*=}"
+    cur="$(grep -m1 "^${name}=" <<< "$HAVE" | cut -d= -f2-)"
+    if [[ "$cur" != "$val" ]]; then
+      "$AST" -rx "dialplan set global ${name} ${val}" >/dev/null 2>&1
+      [[ "${2:-}" == "--verbose" ]] && echo "  set   $name"
+      changed=$((changed + 1))
+    else
+      same=$((same + 1))
+    fi
+  done <<< "$WANT"
+
+  # Read back. A silent failure here means the running dialplan is asserting
+  # numbers that are not in dids.csv, which is worth failing loudly over.
+  NOW="$("$AST" -rx "dialplan show globals" 2>/dev/null | sed 's/^[[:space:]]*//')"
+  bad=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    name="${line%%=*}"; val="${line#*=}"
+    [[ "$(grep -m1 "^${name}=" <<< "$NOW" | cut -d= -f2-)" == "$val" ]] || {
+      echo "  ${R}MISMATCH${N} $name"; bad=$((bad + 1)); }
+  done <<< "$WANT"
+
+  echo "  updated $changed, already correct $same, mismatched $bad"
+  if (( bad )); then
+    echo "  ${R}the running dialplan does not match $CONF_FILE${N}"
+    exit 1
+  fi
+  echo "  ${G}running dialplan matches $CONF_FILE${N}"
+
+  # clearglobalvars=no also means a global for a pool you DELETED from
+  # dids.csv survives until a full restart. Nothing above can remove it.
+  STALE="$(grep -oE '^SBC_DID_POOL_[0-9]{3}' <<< "$NOW" | sort -u)"
+  FILE_POOLS="$(grep -oE '^SBC_DID_POOL_[0-9]{3}' <<< "$WANT" | sort -u)"
+  ORPHAN="$(comm -13 <(echo "$FILE_POOLS") <(echo "$STALE"))"
+  if [[ -n "$ORPHAN" ]]; then
+    echo
+    echo "  ${Y}STALE POOLS still in memory${N} - not in the rendered file:"
+    sed 's/^SBC_DID_POOL_/    NPA /' <<< "$ORPHAN"
+    echo "  These will keep being asserted until Asterisk fully restarts."
+    echo "  Drain with killswitch.sh on, then restart, to clear them."
+    exit 2
   fi
   ;;
 
