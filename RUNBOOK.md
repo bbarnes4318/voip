@@ -21,6 +21,68 @@ Deploy, verify, run the customer test, and roll back.
 > suite are all here and internally consistent. What is missing is the
 > evidence, and evidence you did not gather is not evidence.
 
+### What HAS been verified, off-box
+
+Three things run on a workstation without Asterisk, so they were actually run.
+None of them is an acceptance criterion and none of them substitutes for one.
+
+**1. The renderer, against real inputs.** `render.sh` was run with the example
+config, the example DID pool and the example blocklist, and separately with
+the test config. Both produced a complete `/etc/asterisk` set with no
+unresolved placeholders. Its refusal paths were exercised individually and
+each stops the render with the offending line number: an OVERFLOW pool below
+20, a DID whose NXX starts with 1, a 5-digit DID, a non-numeric rate, and a
+blocklist prefix that could never match.
+
+**2. `tools/build-blocklist.py`, against a synthetic deck.** Real command
+output, on invented input — `tools/testdata/sample-rate-deck.csv`, which is
+tracked. It found the header three rows down, detected the columns, dropped
+Alaska/Hawaii/Canada/Caribbean/toll-free/premium under `--scope conus`, kept
+the worse of two rates for a duplicated prefix, and refused to write an empty
+file when nothing met the threshold. **It has never seen a real deck.** Run it
+against yours and check the blocked count before trusting it.
+
+**3. The DID selection arithmetic, by transcription.** The ring-walk
+expression and the cap comparison from `[sbc-did]` were transcribed into a
+throwaway script and run over the criterion 13 and 14 shapes. No DID exceeded
+the cap; within-pool spread was 1 call; the 6th call into a one-DID pool moved
+to overflow.
+
+> **That last one is a simulation and it is not a test.** It executes the
+> same arithmetic; it does not execute Asterisk. `func_lock`, AstDB
+> persistence, real concurrency and Asterisk's own expression evaluator are
+> all absent from it. It can catch an off-by-one in a modulo. It cannot tell
+> you the dialplan works. **Criterion 13 is not satisfied until
+> `run-acceptance.sh` says so on the box.**
+
+The same simulation is the evidence for one design decision worth recording:
+across 6 gateways and 600 calls, a per-call rotor used all six at 100 calls
+each, while `${UNIQUEID}`-sequence-modulo used **three of six at 200 each** —
+because that sequence counts channels, not calls, and an answered call
+allocates two. With 5 gateways both approaches look identical, which is
+exactly why the bug would have survived a smaller test.
+
+### The dialplan has NOT been loaded by Asterisk
+
+No `dialplan reload`, no `pjsip reload`, no call has ever traversed it. Label
+targets were checked statically (40 references, 30 labels, none dangling), but
+that is a text check. The first thing to do on the box, before anything else:
+
+```bash
+sudo asterisk -rx "dialplan show sbc-customer" | head -40
+```
+
+```bash
+sudo asterisk -rx "dialplan show sbc-did"
+```
+
+```bash
+sudo asterisk -rx "core show function LOCK" && sudo asterisk -rx "core show function DB"
+```
+
+If `LOCK` or `DB` is missing, the per-DID cap silently stops counting.
+`install.sh` checks for both and fails validation if either is absent.
+
 ---
 
 ## 1. Before you touch the box
@@ -38,6 +100,23 @@ guessing any of them produces a failed test rather than a working SBC.
 - [ ] Whether the customer sources RTP from those same IPs or from a different
       block (if different: `PK_CLIENT_MEDIA_EXTRA`, or their audio dies at the
       firewall)
+- [ ] **The DIDs you own on this subaccount**, with the destination area code
+      each should serve. This box asserts caller ID from that list and cannot
+      place a call without it. `dids.csv.example` ships 555-01XX fiction
+      numbers that no carrier will accept.
+- [ ] **At least 20 numbers for the OVERFLOW pool.** `render.sh` refuses to
+      render below that and there is no override. Overflow absorbs every
+      destination NPA you have not bought numbers in, plus every call whose
+      NPA pool has capped out for the day.
+- [ ] Confirmation from FracTEL that **these specific numbers are authorized
+      as caller ID on this subaccount**. Asserting a DID they have not
+      provisioned to you is its own kind of fraud alert. This is a separate
+      question from IP authorization and it is easy to assume it is included.
+- [ ] The current **ShortDuration rate deck**, exported as CSV, for
+      `tools/build-blocklist.py`
+- [ ] A decision on `DID_DAILY_CAP` (default 200). Pool size × cap has to
+      exceed the daily volume the customer expects into each area code, or
+      you will overflow constantly.
 
 Sanity check with FracTEL before test day: *"my SBC is 
 `<SBC_IP>`, it will not register, authorize it by IP on subaccount X."*
@@ -60,6 +139,31 @@ Fill it in. `config.env` is gitignored and must stay that way.
 
 ```bash
 $EDITOR config.env
+```
+
+Now the two data files. Both are gitignored, both are mandatory, and
+`render.sh` refuses to run without either.
+
+```bash
+cp dids.csv.example dids.csv && chmod 600 dids.csv && $EDITOR dids.csv
+```
+
+Replace every 555-01XX number with a DID you actually own on this subaccount.
+Put at least 20 in the `OVERFLOW` pool. Getting this wrong does not fail
+quietly — `render.sh` reports the offending line number and stops.
+
+Generate the blocklist from the rate deck rather than editing it by hand:
+
+```bash
+python3 tools/build-blocklist.py --deck ~/decks/ShortDuration.csv --out blocklist.csv
+```
+
+It prints a summary — rows read, in scope, below threshold, blocked, worst
+rate. Sanity-check the blocked count against what you expect from the deck
+before continuing. If it is wildly off, the wrong column was detected:
+
+```bash
+python3 tools/build-blocklist.py --deck ~/decks/ShortDuration.csv --list-columns
 ```
 
 Dry run first — it prints what it would do and changes nothing:
@@ -232,6 +336,74 @@ without dropping calls, set the dialplan global directly and then edit
 sudo asterisk -rx "dialplan set global SBC_MAX_CONCURRENT 100"
 ```
 
+### The DID pool
+
+**How the numbers are doing today** — usage against the cap, how close
+anything is to falling out of rotation, and the overflow rate:
+
+```bash
+./didctl.sh status
+```
+
+**Which pools Asterisk actually loaded** — not what `dids.csv` says, what is
+in the running dialplan:
+
+```bash
+./didctl.sh pools
+```
+
+**Prove distribution from the CDR** — this is the artefact to hand over if
+anyone asks whether traffic is concentrated on one number:
+
+```bash
+./didctl.sh distribution
+```
+
+**One number's history:**
+
+```bash
+./didctl.sh show 12125550101
+```
+
+**Add numbers to a pool.** Edit `dids.csv`, then re-render. The daily counters
+are in the Asterisk database, not the dialplan, so they are not disturbed:
+
+```bash
+sudo ./install.sh --config-only
+```
+
+**After a rate deck update** — regenerate and reload. Do this monthly:
+
+```bash
+python3 tools/build-blocklist.py --deck ~/decks/ShortDuration-<month>.csv --out blocklist.csv && sudo ./install.sh --config-only
+```
+
+**Overflow rate is climbing.** Not an error and nothing is broken: an NPA pool
+is undersized for the traffic going into it. Find which one, then buy numbers
+for it.
+
+```bash
+./didctl.sh distribution | sed -n '/selection reason/,$p'
+```
+
+**`NO_DID_AVAILABLE` in the log.** Every DID in the destination's NPA pool
+*and* every DID in overflow is at its daily cap, and calls are being refused
+with 503. This needs a decision, not a restart:
+
+```bash
+grep NO_DID_AVAILABLE /var/log/asterisk/messages | tail
+```
+
+```bash
+./didctl.sh today | sort -k2 -rn | head -20
+```
+
+Either raise `DID_DAILY_CAP`, or add numbers. Raising the cap concentrates
+more traffic on the same numbers, which is the thing the cap exists to
+prevent — prefer adding numbers. `didctl.sh reset` exists but zeroing counters
+mid-day lets every number carry another full allowance on top of what it has
+already sent, so it is a deliberate act and it requires `--force`.
+
 **Find one call** (for a traceback, or a customer complaint):
 
 ```bash
@@ -276,6 +448,18 @@ before you paste it.
 | 9 | `killswitch.sh on` blocks new calls in under 1s; `off` restores | timed, then SIPp | not captured |
 | 10 | RTP never flows directly customer↔carrier | `tcpdump` + endpoint readback | not captured (on-box half only — see below) |
 | 11 | Everything returns after a reboot, firewall intact | `sudo reboot` then check | not captured |
+| 12 | Customer CID `2125551234` appears nowhere in the outbound INVITE; our DID is in `From`, `P-Asserted-Identity` and `Remote-Party-ID` | SIPp + stub `-trace_msg` | not captured (on-box half only — see 6) |
+| 12b | Customer CID `0000000000` is **replaced**, not refused; call completes; WARN logged | SIPp + log scan | not captured |
+| 13 | 1000 calls, mixed NPAs: no DID over its cap, even distribution per pool | from the CDR alone | not captured |
+| 14 | Cap 5: the 6th call that would use a DID selects a different one | NPA 989 has one DID | not captured |
+| 15 | Destination NPA with no pool selects from overflow and logs WARN | NPA 505 | not captured |
+| 16 | Blocklisted prefix refused with 503, longest prefix wins | `destinations-blocked.csv` | not captured |
+| 17 | 600+ calls spread across all six gateways | from the CDR alone | not captured |
+
+Criteria 13 and 17 are measured from the same 1000-call run — two questions
+about one mechanism. Criterion 17's important half is **all six** gateways
+taking traffic: a rotation that buckets by wall clock still produces a
+plausible even split across a subset.
 
 ### 5a. Commands, for pasting output against
 
@@ -293,6 +477,14 @@ asterisk -rx "pjsip show identifies"
 
 ```bash
 sudo ./tests/run-acceptance.sh
+```
+
+```bash
+./didctl.sh pools
+```
+
+```bash
+./didctl.sh distribution
 ```
 
 ```bash
@@ -353,11 +545,67 @@ it should be, on Hetzner. If `install.sh` warns that `SBC_PUBLIC_IP` is not on
 any interface, set `SBC_NAT_LOCAL_NET` and re-run. Setting it when it is not
 needed *causes* the problem it is meant to fix.
 
+### Caller ID on the wire — criterion 12, carrier half
+
+The suite proves the INVITE **leaving this box** carries our DID in `From`,
+`P-Asserted-Identity` and `Remote-Party-ID`, and that the customer's value
+appears nowhere in it. It cannot prove what FracTEL does with that.
+
+Two things to confirm on the first live call, and neither is optional:
+
+**1. FracTEL accepts these numbers as caller ID on this subaccount.** IP
+authorization and caller-ID authorization are separate provisioning steps and
+it is easy to assume the first covers the second. Asserting a DID they have
+not provisioned to you is its own fraud alert. Ask them directly, by number.
+
+**2. The headers arrive intact.** Place one call and capture it:
+
+```bash
+sudo tcpdump -ni any -s0 -A 'port 5060' | grep -iE '^(INVITE|From|P-Asserted-Identity|Remote-Party-ID):'
+```
+
+All three must show the same DID. Cross-check against what the SBC believed
+it sent:
+
+```bash
+grep SBC-DIAL /var/log/asterisk/messages | tail -1
+```
+
+That line carries both `custcid=` (what the customer sent, discarded) and
+`did=` (what was asserted). If `custcid` ever appears in the captured INVITE,
+stop taking traffic — that is the failure this whole version exists to
+prevent.
+
 ### STIR/SHAKEN attestation
 
-Nothing on this box signs or attests. FracTEL signs, and customer-supplied CID
-gets **B** attestation — that is correct and expected, not a fault. A is only
-for CID that is a FracTEL DID. Do not try to force A.
+Nothing on this box signs or attests. FracTEL signs.
+
+This changed with carrier-assigned caller ID. Previously the CID was
+customer-supplied and **B** attestation was correct and expected. Now the
+asserted number is a FracTEL DID, which is the condition for **A**.
+
+Whether FracTEL actually grants A depends on their provisioning, not on
+anything here. **Confirm it on the first live call rather than assuming it** —
+and do not treat B as a fault until you have checked that the numbers in
+`dids.csv` are provisioned to this subaccount. B on a DID they have not
+associated with you is a provisioning gap, not a signing bug.
+
+### The blocklist misses ported numbers
+
+The rate deck is LRN-rated: the charge follows where a number has been ported
+to. This box performs no LNP dip and matches the number dialled, so it catches
+numbers natively in expensive prefixes and misses numbers ported into them.
+
+There is no on-box test for this and no fix that does not involve buying LNP
+dips. Manage it by reconciliation instead — monthly, compare FracTEL's rated
+CDR against `blocklist.csv` and add whatever cost more than it should:
+
+```bash
+./didctl.sh distribution | head -20
+```
+
+Then re-run `tools/build-blocklist.py` against the new deck. Treat the
+blocklist as reducing exposure, not eliminating it.
 
 ---
 

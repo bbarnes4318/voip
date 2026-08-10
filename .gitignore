@@ -6,6 +6,21 @@ config.env
 !*.env.example
 !tests/config.test.env.example
 
+# The DID pool and the LRN blocklist hold real purchased numbers and real
+# carrier rate-deck data. Only the .example files are tracked.
+dids.csv
+blocklist.csv
+!dids.csv.example
+!blocklist.csv.example
+
+# Rate decks exported from the carrier portal. Never commit one.
+decks/
+*rate-deck*.csv
+*rate-deck*.xlsx
+*ShortDuration*.csv
+*ShortDuration*.xlsx
+!tools/testdata/sample-rate-deck.csv
+
 *.key
 *.pem
 *.crt
@@ -51,3 +66,7 @@ RUNBOOK-acceptance.generated.md
 Thumbs.db
 .idea/
 .vscode/
+
+# Python bytecode from tools/
+__pycache__/
+*.pyc

@@ -117,6 +117,18 @@ emit "Criterion 10 — direct_media is off on the customer leg" \
      bash -c "asterisk -rx 'pjsip show endpoint pkclient1' | grep -iE 'direct_media|rtp_symmetric|force_rport'"
 emit "Criterion 10 — direct_media is off on the carrier leg" \
      bash -c "asterisk -rx 'pjsip show endpoint fractel1' | grep -iE 'direct_media|rtp_symmetric|force_rport'"
+emit "Criterion 12 — the carrier leg asserts our DID, not the customer's" \
+     bash -c "asterisk -rx 'pjsip show endpoint fractel1' | grep -iE 'send_pai|send_rpid|send_diversion|trust_id_outbound|trust_id_inbound'"
+emit "Criteria 13/14/15 — DID pools loaded into the running dialplan" \
+     bash -c "$ROOT/didctl.sh pools"
+emit "Criterion 13 — per-DID distribution and cap compliance, from the CDR alone" \
+     bash -c "$ROOT/didctl.sh distribution"
+emit "Criterion 14 — per-DID daily cap and today's usage" \
+     bash -c "$ROOT/didctl.sh status"
+emit "Criterion 16 — high-cost prefixes loaded" \
+     bash -c "asterisk -rx 'dialplan show sbc-lrn-blocklist' | tail -3"
+emit "Dialplan functions the DID logic depends on" \
+     bash -c "for f in LOCK TRYLOCK UNLOCK DB DIALPLAN_EXISTS; do printf '%-16s ' \$f; asterisk -rx \"core show function \$f\" >/dev/null 2>&1 && echo present || echo MISSING; done"
 emit "Firewall ruleset (layer 1)" \
      bash -c "nft list table inet sbc 2>/dev/null || echo 'NOT LOADED'"
 emit "Boot persistence — unit states" \
@@ -143,6 +155,12 @@ SUITE_RC=$?
   echo
   echo "> Criteria 3b (host firewall) and 11 (reboot) report SKIP. They cannot be"
   echo "> proven from on-box and must be done by hand — see RUNBOOK.md."
+  echo ">"
+  echo "> Criterion 12 was checked against a SIPp stub. It proves the INVITE"
+  echo "> leaving this box carries our DID in all three identity headers and none"
+  echo "> of the customer's value. It does NOT prove what FracTEL attests off, or"
+  echo "> that they accept these numbers as caller ID on this subaccount. Both"
+  echo "> need the live trunk — RUNBOOK.md section 6."
 } >> "$OUT"
 
 echo

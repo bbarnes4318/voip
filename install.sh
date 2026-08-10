@@ -64,6 +64,18 @@ fi
 # shellcheck disable=SC1090
 set -a; source "$CONF"; set +a
 
+# dids.csv holds numbers we own and blocklist.csv holds carrier pricing.
+# Neither is a credential, but neither belongs to every user on the box.
+for _f in "${DIDS_CSV:-dids.csv}" "${BLOCKLIST_CSV:-blocklist.csv}"; do
+  [[ "$_f" = /* ]] || _f="$HERE/$_f"
+  [[ -f "$_f" ]] || continue
+  _p="$(stat -c '%a' "$_f")"
+  if [[ "$_p" != "600" && "$_p" != "400" ]]; then
+    info "tightening permissions on $(basename "$_f") (was $_p)"
+    run chmod 600 "$_f"
+  fi
+done
+
 ASTERISK_INSTALL_METHOD="${ASTERISK_INSTALL_METHOD:-package}"
 ASTERISK_SOURCE_VERSION="${ASTERISK_SOURCE_VERSION:-20-current}"
 CDR_CSV_PATH="${CDR_CSV_PATH:-/var/log/asterisk/cdr-custom/sbc.csv}"
@@ -226,8 +238,25 @@ CREATE TABLE IF NOT EXISTS sbc_cdr (
     fractel_gateway_used  varchar(32),
     sip_call_id           varchar(255) NOT NULL,
     reject_reason         varchar(64),
-    uniqueid              varchar(64)
+    uniqueid              varchar(64),
+    -- Carrier-assigned caller ID. selected_did is what actually went out in
+    -- From, P-Asserted-Identity and Remote-Party-ID; caller_id above is what
+    -- the customer asked for and did not get.
+    selected_did          varchar(16),
+    did_selection_reason  varchar(16),
+    destination_npa       varchar(8),
+    did_daily_count_at_selection integer,
+    -- Always NULL from the SBC: no LNP dip happens here. Populated by
+    -- reconciliation against FracTEL's LRN-rated CDR.
+    lrn                   varchar(16)
 );
+-- Added after the initial deployment, so an existing table needs them too.
+ALTER TABLE sbc_cdr ADD COLUMN IF NOT EXISTS selected_did         varchar(16);
+ALTER TABLE sbc_cdr ADD COLUMN IF NOT EXISTS did_selection_reason varchar(16);
+ALTER TABLE sbc_cdr ADD COLUMN IF NOT EXISTS destination_npa      varchar(8);
+ALTER TABLE sbc_cdr ADD COLUMN IF NOT EXISTS did_daily_count_at_selection integer;
+ALTER TABLE sbc_cdr ADD COLUMN IF NOT EXISTS lrn                  varchar(16);
+CREATE INDEX IF NOT EXISTS sbc_cdr_did_idx ON sbc_cdr (selected_did);
 CREATE INDEX IF NOT EXISTS sbc_cdr_calldate_idx  ON sbc_cdr (calldate);
 CREATE INDEX IF NOT EXISTS sbc_cdr_srcip_idx     ON sbc_cdr (source_ip);
 CREATE INDEX IF NOT EXISTS sbc_cdr_callid_idx    ON sbc_cdr (sip_call_id);
@@ -364,6 +393,35 @@ AccuracySec=10s
 WantedBy=timers.target
 EOF
 
+# --- DID counter housekeeping ---
+# Per-DID daily counters are keyed by date, so they roll over at local
+# midnight on their own — this timer does NOT reset anything and must never
+# be made to. It only stops old day-families accumulating in the Asterisk
+# database forever. A week of history is enough to answer "how much did that
+# number carry on Tuesday" without turning astdb into an archive.
+write_unit sbc-did-prune.service <<EOF
+[Unit]
+Description=Drop DID counter keys older than a week
+After=asterisk.service
+
+[Service]
+Type=oneshot
+ExecStart=$HERE/didctl.sh prune 7
+EOF
+
+write_unit sbc-did-prune.timer <<EOF
+[Unit]
+Description=Weekly DID counter housekeeping
+
+[Timer]
+OnCalendar=Sun 04:17
+Persistent=true
+AccuracySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+
 # --- killswitch state restore ---
 # Without this, a reboot while the killswitch is on would silently start
 # accepting customer traffic again.
@@ -390,6 +448,7 @@ if [[ "$DRY" == 0 ]]; then
   systemctl enable asterisk.service    >/dev/null 2>&1 || true
   systemctl enable nftables.service    >/dev/null 2>&1 || true
   systemctl enable sbc-healthcheck.timer >/dev/null 2>&1 || true
+  systemctl enable sbc-did-prune.timer >/dev/null 2>&1 || true
   systemctl enable sbc-killswitch.service >/dev/null 2>&1 || true
   [[ -f /etc/systemd/system/sbc-siptrace.service ]] && \
     systemctl enable sbc-siptrace.service >/dev/null 2>&1 || true
@@ -461,6 +520,45 @@ done
 GWN="$(grep -c 'fractel' <<< "$EP_OUT" || true)"
 info "fractel endpoint lines: $GWN"
 
+# --- dialplan functions the DID logic depends on --------------------------
+# The module denylist in render.sh removes every path to an external lookup —
+# no func_curl, no func_odbc, no AGI — so DID rotation and the daily cap are
+# built out of these five. A missing one does not stop Asterisk loading; it
+# makes ${LOCK(...)} expand to nothing and the cap silently stop counting.
+# Check for them explicitly rather than discovering it in a fraud alert.
+for fn in LOCK TRYLOCK UNLOCK DB DIALPLAN_EXISTS CUT IF STRFTIME; do
+  if asterisk -rx "core show function $fn" 2>/dev/null | grep -qi "$fn"; then
+    :
+  else
+    echo "    MISSING dialplan function $fn" >&2
+    case "$fn" in
+      LOCK|TRYLOCK|UNLOCK)
+        echo "      func_lock.so is not loaded. Without it the per-DID daily cap" >&2
+        echo "      has no mutual exclusion and will undercount under load." >&2 ;;
+      DB)
+        echo "      func_db.so is not loaded. Daily counters cannot be stored at" >&2
+        echo "      all and the cap will not enforce." >&2 ;;
+      DIALPLAN_EXISTS)
+        echo "      func_dialplan.so is not loaded. The high-cost prefix" >&2
+        echo "      blocklist will never match anything." >&2 ;;
+    esac
+    FAILED=1
+  fi
+done
+
+# --- DID pool actually reached the running dialplan -----------------------
+POOLN="$(asterisk -rx "dialplan show globals" 2>/dev/null | grep -c '^SBC_DID_POOL_' || true)"
+OVF="$(asterisk -rx "dialplan show globals" 2>/dev/null | awk -F'=' '/^SBC_DID_CNT_OVERFLOW/{print $2}')"
+if [[ "${POOLN:-0}" -lt 1 || -z "$OVF" ]]; then
+  echo "    DID pool did not load into the dialplan — the SBC cannot assign caller ID" >&2
+  FAILED=1
+else
+  info "DID pools loaded: $POOLN (overflow holds $OVF)"
+fi
+
+LRNN="$(asterisk -rx "dialplan show sbc-lrn-blocklist" 2>/dev/null | grep -c "'" || true)"
+info "high-cost prefixes loaded: $(( LRNN > 0 ? LRNN - 1 : 0 ))"
+
 echo
 "$HERE/healthcheck.sh" || true
 
@@ -477,6 +575,8 @@ cat <<EOF
 ===========================================================================
 
   config      $CONF
+  dids        ${DIDS_CSV:-dids.csv}         (the numbers this box asserts)
+  blocklist   ${BLOCKLIST_CSV:-blocklist.csv}    (high-cost prefixes, from the rate deck)
   asterisk    $AST_ETC/*.conf   (rendered — edit the .tpl files, not these)
   cdr         $CDR_CSV_PATH
   sip traces  $SIP_TRACE_DIR
@@ -484,9 +584,22 @@ cat <<EOF
 
   Next:
     1. sudo $HERE/firewall.sh confirm      <- do this from a SECOND ssh session
-    2. $HERE/monitor.sh
-    3. $HERE/tests/run-acceptance.sh       <- see tests/README.md first
-    4. Probe the firewall FROM ANOTHER MACHINE. The on-box test suite
+    2. $HERE/didctl.sh pools               <- confirm the DID pools Asterisk loaded
+    3. $HERE/monitor.sh
+    4. $HERE/tests/run-acceptance.sh       <- see tests/README.md first
+    5. Probe the firewall FROM ANOTHER MACHINE. The on-box test suite
        cannot see it. RUNBOOK.md has the nmap commands.
+
+  Caller ID is assigned by this box. The customer's value is discarded on
+  every call and recorded in the CDR. Confirm on the first live call that
+  From, P-Asserted-Identity and Remote-Party-ID all carry one of your DIDs:
+
+    $HERE/didctl.sh status
+    grep SBC-DIAL /var/log/asterisk/messages | tail
+
+  Regenerate the blocklist after every rate deck update:
+
+    python3 $HERE/tools/build-blocklist.py --deck <ShortDuration.csv>
+    sudo $HERE/install.sh --config-only
 
 EOF

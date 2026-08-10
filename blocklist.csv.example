@@ -1,0 +1,73 @@
+# ===========================================================================
+# blocklist.csv — high-cost LRN prefixes refused with 503.
+#
+# DO NOT MAINTAIN THIS BY HAND. Generate it from the carrier rate deck:
+#
+#     python3 tools/build-blocklist.py \
+#         --deck ~/decks/ShortDuration-2026-08.csv \
+#         --out blocklist.csv \
+#         --threshold 0.10
+#
+# Re-run it after every deck update. The deck changes monthly; a stale
+# blocklist is a cost control that has quietly stopped controlling costs.
+#
+# blocklist.csv is gitignored — it is derived from carrier pricing. Only this
+# .example file is tracked, and every row in it is ILLUSTRATIVE: the prefixes
+# use the fictional 555 NXX and the rates are made up. Real output from
+# build-blocklist.py looks the same but carries real prefixes and real money.
+#
+# FORMAT
+#
+#   prefix          digits only, no +. The Code column from the FracTEL
+#                   outbound deck: country code 1 followed by NPA-NXX, so
+#                   normally 7 digits. VARIABLE LENGTH IS SUPPORTED — shorter
+#                   rows (NPA only, 4 digits) and longer rows (down to a
+#                   specific line range) both work.
+#   rate_per_min    decimal. AUDIT AND LOGGING ONLY, never used in matching.
+#                   It exists so the WARN line says what the blocked call
+#                   would have cost.
+#   destination     free-text label from the deck, for logs. Commas and quotes
+#                   are stripped on load and it is truncated to 40 characters.
+#
+# The header row is required. Blank lines and lines beginning with # are
+# ignored.
+#
+# MATCHING
+#
+#   1. The dialled number is normalised to 11 digits: 1 + NPA + NXX + line.
+#   2. LONGEST-PREFIX match, not exact. 1252555 blocks 12525551234.
+#   3. When several rows match, the longest wins.
+#   4. On a match: refuse with 503 and log WARN with the prefix, the rate, the
+#      destination label and the full dialled number.
+#
+# This is not a linear scan. render.sh compiles the file into a generated
+# dialplan context and the match is a single hash lookup in Asterisk's
+# extension matcher, so 1,248 rows cost the same per INVITE as 12.
+#
+# KNOWN LIMITATION — READ THIS
+#
+# The deck is LRN-rated: the real charge follows the LRN, meaning where the
+# number has been ported to, not the number that was dialled. The SBC has no
+# LRN at call time — it performs no LNP dip — so it matches on the dialled
+# number.
+#
+# So this catches numbers natively in expensive prefixes and MISSES numbers
+# ported into them. It is partial cost control, not complete. The CDR carries
+# an lrn column for reconciliation against FracTEL's own rated CDR; expensive
+# prefixes discovered that way get added here and caught from then on.
+# ===========================================================================
+prefix,rate_per_min,destination
+1252555,1.566400,NC-252 ILLUSTRATIVE
+1531555,1.566400,NE-531 ILLUSTRATIVE
+1218555,0.765600,MN-218 ILLUSTRATIVE
+1712555,0.592350,IA-712 ILLUSTRATIVE
+1605555,0.405240,SD-605 ILLUSTRATIVE
+1406555,0.255860,MT-406 ILLUSTRATIVE
+1307555,0.168080,WY-307 ILLUSTRATIVE
+1620555,0.126500,KS-620 ILLUSTRATIVE
+1719555,0.104170,CO-719 ILLUSTRATIVE
+1938555,0.091080,AL-938 ILLUSTRATIVE
+# A shorter row blocks a whole NPA. A longer row narrows to a line range.
+# Longest match wins, so the 10-digit row below overrides the 4-digit one.
+1268,0.696300,NPA-WIDE ILLUSTRATIVE
+1268555010,1.127500,NARROWER ILLUSTRATIVE

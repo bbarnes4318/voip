@@ -1,0 +1,114 @@
+# ===========================================================================
+# dids.csv — the pool of DIDs this SBC asserts as caller ID.
+#
+#     cp dids.csv.example dids.csv && chmod 600 dids.csv && $EDITOR dids.csv
+#
+# dids.csv is gitignored. Every number below is in the 555-01XX range that
+# NANPA reserves for fiction and testing. NONE of these are real, and none of
+# them will render — render.sh will load them fine, but a call asserting
+# 555-01XX will be rejected by any carrier. Replace them with the DIDs you
+# actually own on the FracTEL subaccount.
+#
+# FORMAT
+#
+#   npa,did
+#
+#   npa   3-digit destination area code this DID is used for, or the literal
+#         OVERFLOW for the fallback pool. Case-insensitive.
+#   did   10 or 11 digits. Punctuation is stripped and the value is normalised
+#         to 11 digits (a leading 1 is added if absent), so 212-555-0101,
+#         2125550101 and 12125550101 are all the same number.
+#
+# Blank lines and lines beginning with # are ignored. A "npa,did" header row
+# is optional and ignored if present.
+#
+# SELECTION
+#
+#   1. Destination NPA has a pool  -> rotate within that pool
+#   2. It does not, or every DID in it is at its daily cap
+#                                  -> rotate within OVERFLOW, log WARN
+#   3. OVERFLOW is capped out too  -> refuse with 503, log ERROR
+#
+# There is no single default number anywhere in that path. That is the whole
+# point: a silent fallback onto one DID is what put 50,864 calls on a single
+# number in an afternoon and tripped the carrier's fraud alert.
+#
+# RULES render.sh ENFORCES
+#
+#   - every did is 11 digits after normalisation, with NPA and NXX both
+#     starting 2-9. A malformed row is a hard error with its line number, not
+#     a silently skipped line.
+#   - the OVERFLOW pool holds at least OVERFLOW_MIN numbers (default 20).
+#   - duplicates within a pool are collapsed, and a DID appearing in more than
+#     one pool is reported: its daily cap is shared across every pool it is
+#     in, because the counter is keyed on the number.
+#
+# SIZING
+#
+# A pool needs enough numbers that DID_DAILY_CAP x pool_size comfortably
+# exceeds the daily volume you expect into that NPA. At the default cap of 200
+# a four-number pool carries 800 calls/day into that area code before it
+# starts overflowing. Watch did_selection_reason=overflow in the CDR — a
+# rising overflow rate for one NPA means that pool is undersized, not that
+# anything is broken.
+# ===========================================================================
+
+npa,did
+
+# --- New York -------------------------------------------------------------
+212,2125550101
+212,2125550102
+212,2125550103
+212,2125550104
+
+# --- Los Angeles ----------------------------------------------------------
+310,3105550101
+310,3105550102
+310,3105550103
+310,3105550104
+
+# --- San Francisco --------------------------------------------------------
+415,4155550101
+415,4155550102
+415,4155550103
+415,4155550104
+
+# --- Chicago --------------------------------------------------------------
+773,7735550101
+773,7735550102
+773,7735550103
+773,7735550104
+
+# ===========================================================================
+# OVERFLOW — used when the destination NPA has no pool of its own, or when
+# every DID in that pool has hit its daily cap.
+#
+# At least OVERFLOW_MIN (20) numbers. render.sh refuses to render with fewer.
+# This pool absorbs every area code you have not bought numbers in, so it
+# takes more traffic than any single NPA pool and obeys the same daily cap.
+# Twenty is a floor, not a target — size it against your actual overflow rate.
+# ===========================================================================
+OVERFLOW,6465550101
+OVERFLOW,6465550102
+OVERFLOW,6465550103
+OVERFLOW,6465550104
+OVERFLOW,6465550105
+OVERFLOW,6465550106
+OVERFLOW,6465550107
+OVERFLOW,6465550108
+OVERFLOW,6465550109
+OVERFLOW,6465550110
+OVERFLOW,6465550111
+OVERFLOW,6465550112
+OVERFLOW,6465550113
+OVERFLOW,6465550114
+OVERFLOW,6465550115
+OVERFLOW,6465550116
+OVERFLOW,6465550117
+OVERFLOW,6465550118
+OVERFLOW,6465550119
+OVERFLOW,6465550120
+OVERFLOW,6465550121
+OVERFLOW,6465550122
+OVERFLOW,6465550123
+OVERFLOW,6465550124

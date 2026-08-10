@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  uac-invite-fast.xml — the customer dialer, for volume runs.
+
+  Identical to uac-invite.xml except that it hangs up as soon as the call is
+  answered instead of holding it. Used by acceptance criteria 13 and 17,
+  which place 1000 calls and care only about which DID and which gateway each
+  one selected.
+
+  Why a separate scenario rather than uac-invite.xml with -d 0:
+
+    sipp's -d only sets the duration of <pause> instructions that have NO
+    milliseconds attribute of their own. uac-invite.xml pauses for an
+    explicit 20000ms, so -d cannot shorten it. 1000 calls holding 20 seconds
+    each against a concurrency cap of 10 would take over half an hour and
+    spend most of it refused with CONCURRENCY_CAP.
+
+  Pair it with uas-fractel-stub-fast.xml, which answers without the 2-second
+  ring delay. Together a call completes in tens of milliseconds, so 12 calls
+  a second sits at well under one concurrent call and the volume criteria
+  measure DID and gateway distribution rather than the concurrency limiter.
+
+  Injection fields (see destinations-volume.csv):
+    [field0] = destination number
+    [field1] = caller ID
+-->
+
+<scenario name="SBC customer leg - answered and released immediately">
+
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      User-Agent: SIPp-AcceptanceTest
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=sipp 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0 8 101
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:8 PCMA/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="183" optional="true"/>
+
+  <recv response="200" rtd="true"/>
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:[field1]@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- No pause. The CDR row is written on hangup either way, and every
+       column criteria 13 and 17 read is set before the Dial. billsec will be
+       0 or 1 second, which is correct and is not what is being measured. -->
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "[field1]" <sip:[field1]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+
+  <ResponseTimeRepartition value="10, 50, 100, 200, 500, 1000"/>
+  <CallLengthRepartition value="10, 100, 500, 1000, 5000"/>
+
+</scenario>

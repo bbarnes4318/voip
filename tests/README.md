@@ -1,6 +1,6 @@
 # SBC acceptance tests
 
-Fixtures and a driver for acceptance criteria 1–11.
+Fixtures and a driver for acceptance criteria 1–17.
 
 ```
 run-acceptance.sh              driver, PASS/FAIL/SKIP per criterion
@@ -8,21 +8,56 @@ testenv.sh                     swap between production and test config
 capture-acceptance.sh          run the suite and emit REDACTED output for RUNBOOK.md
 config.test.env.example        test configuration (loopback everything)
 
-sipp/uac-invite.xml            customer dialer, happy path      crit 4, 6, 7, 8, 10
-sipp/uac-expect-reject.xml     unauthorized source is refused   crit 3a
-sipp/uac-expect-503.xml        dialplan refuses the call        crit 5, 6, 9
-sipp/uac-expect-403-badcid.xml malformed caller ID is refused
-sipp/uac-empty-cid.xml         absent caller ID is refused
-sipp/uas-fractel-stub.xml      stands in for the FracTEL trunk
+dids.test.csv                  DID pool: 8 NPAs x 40, one 1-DID NPA, 24 overflow
+blocklist.test.csv             5 high-cost prefixes, incl. a longest-match pair
 
-sipp/destinations.csv          valid NANP destinations
-sipp/destinations-badnanp.csv  non-NANP, malformed, and high-risk NANP
-sipp/destinations-badcid.csv   alpha / short / self-dial / bad-NPA caller IDs
+sipp/uac-invite.xml            customer dialer, holds the call  crit 4, 6, 7, 8, 10, 12
+sipp/uac-invite-fast.xml       answers and releases at once     crit 13, 14, 15, 17
+sipp/uac-expect-reject.xml     unauthorized source is refused   crit 3a
+sipp/uac-expect-503.xml        dialplan refuses the call        crit 5, 6, 9, 16
+sipp/uac-expect-403-badcid.xml malformed caller ID is refused   (only when
+sipp/uac-empty-cid.xml         absent caller ID is refused       VALIDATE_CALLERID=true)
+sipp/uas-fractel-stub.xml      the FracTEL trunk, 2s ring, RTP echo
+sipp/uas-fractel-stub-fast.xml the FracTEL trunk, instant answer, volume only
+
+sipp/destinations.csv           valid NANP destinations
+sipp/destinations-badnanp.csv   non-NANP, malformed, and high-risk NANP
+sipp/destinations-badcid.csv    alpha / short / self-dial / bad-NPA caller IDs
+sipp/destinations-cidrewrite.csv  crit 12  — CID 2125551234, must not leak
+sipp/destinations-cidbad.csv      crit 12b — CID 0000000000, must be replaced
+sipp/destinations-cap.csv         crit 14  — NPA 989, which has ONE DID
+sipp/destinations-overflow.csv    crit 15  — NPA 505, which has NO pool
+sipp/destinations-blocked.csv     crit 16  — blocklisted, incl. longest-match
+sipp/destinations-volume.csv      crit 13/17 — 40 destinations over 8 NPAs
 ```
 
 Every phone number in the fixtures is in the **555-01XX** range that NANPA
 reserves for fiction and testing. If a fixture ever escapes onto a live trunk
-it cannot reach a real subscriber.
+it cannot reach a real subscriber, and no carrier would accept one as caller
+ID either.
+
+---
+
+## The suite mutates state that persists
+
+Two things are different from a normal test run and you should know about both
+before running it on anything you care about.
+
+**It zeroes the per-DID daily counters.** Those counters live in the Asterisk
+database and survive restarts *by design* — that is what makes the cap a daily
+cap. Which means a second run of the suite would inherit the first run's
+counts and criterion 14 would behave differently every time. So the driver
+calls `didctl.sh reset --all --force` at startup, and again before criteria 13
+and 14.
+
+On a box carrying customer traffic that would let every number carry another
+full day's allowance on top of what it has already sent. The driver only gets
+that far after the preflight has confirmed the trunk points at the local stub,
+but do not run this suite against production config.
+
+**It starts and stops six SIPp processes.** One stub per gateway, swapped for
+the fast variant during the volume phase and swapped back. `pkill -f
+uas-fractel-stub` on exit. If the suite dies hard, check for strays.
 
 ---
 
@@ -75,7 +110,7 @@ reason. A skip is not a pass.
 |---|---|---|
 | 1 — host firewall | nftables default DROP | **nothing here.** `nmap` from off-box, by hand |
 | 2 — SIP ACL | `[sbc-acl]` + `type=identify` | crit 3a, on-box from an unpermitted loopback address |
-| 3 — dialplan | NANP allowlist, NPA denylist, caps, CID validation | crit 5, 6, 7, 9 and the CID tests |
+| 3 — dialplan | NANP allowlist, NPA denylist, LRN blocklist, caps, DID assignment | crit 5, 6, 7, 9, 12–17 |
 
 Criterion 3a is a real test of layer 2 — `127.0.0.99` is not in the rendered
 ACL, so `res_pjsip_acl` refuses it exactly as it would refuse a stranger on
@@ -104,11 +139,16 @@ sudo ./tests/testenv.sh apply && sudo ./tests/run-acceptance.sh; sudo ./tests/te
 ```
 
 `testenv.sh apply` replaces the running Asterisk configuration with one whose
-trunk points at a local SIPp stub and whose caps are tiny (concurrency 3, CPS
-5) so the capacity criteria prove themselves in seconds. It backs up
+trunk points at six local SIPp stubs, whose caps are small (concurrency 10,
+CPS 20) so the capacity criteria prove themselves in seconds, and whose DID
+pool is the fake one in `dids.test.csv` with `DID_DAILY_CAP=5`. It backs up
 `/etc/asterisk` first. `restore` re-renders production config from
 `config.env` — it does not merely copy the backup back, so what you end up
 with is always exactly what `config.env` describes.
+
+Budget about four minutes. Criteria 13 and 17 place 1000 calls at 12/s, which
+is roughly 90 seconds of that; the rest is qualify waits and the 20-second
+holds in the concurrency and media tests.
 
 Running the suite against the **live FracTEL trunk** would put test INVITEs on
 a brand-new subaccount. That is a good way to have the carrier's fraud system
@@ -124,14 +164,19 @@ so each of these is a distinct bindable source address:
 | `127.0.0.1:5060` | the SBC (Asterisk binds `0.0.0.0`) |
 | `127.0.0.11` | customer 1 → matches `pkclient1` |
 | `127.0.0.12` | customer 2 → matches `pkclient2` |
-| `127.0.0.20:5080` | the FracTEL stub |
+| `127.0.0.20:5080` … `127.0.0.25:5080` | six FracTEL stubs, one per gateway |
 | `127.0.0.99` | unauthorized third party |
 
-They are all different on purpose. Two `type=identify` sections matching the
-same source address is undefined behaviour — whichever endpoint wins is an
-implementation detail, and a test built on it proves nothing.
+Six gateway addresses rather than six ports on one address: `render.sh` emits
+one `type=identify` per gateway matching on **IP**, and six identify sections
+all matching `127.0.0.1` is undefined behaviour — whichever endpoint wins is
+an implementation detail and a test built on it proves nothing.
 
-SIPp binds `-p 5061`…`5064` rather than 5060, because Asterisk holds
+Criterion 17 is the reason there are six at all. With a single gateway the
+round-robin is unprovable, and a broken one would sail through every other
+criterion in this file.
+
+SIPp binds `-p 5061`…`5065` rather than 5060, because Asterisk holds
 `0.0.0.0:5060` and that covers every loopback address.
 
 ---
@@ -169,6 +214,56 @@ flow would exist and the capture would see it. It also reads back
 `direct_media` from both endpoints. What it cannot show is what FracTEL sees
 as the RTP source on the real internet — that is manual, in RUNBOOK.md.
 
+**Criterion 12 reads the stub's received INVITE, not the CDR.** The CDR
+records what the SBC *intended* to assert. The only place to see what it
+actually put on the wire is the message the carrier received, which is why
+every stub runs with `-trace_msg`. The assertion is not merely "our DID is in
+`From`" — it is that the customer's value (`2125551234`) appears **zero
+times** anywhere in the outbound INVITE. A rewrite that set `From` correctly
+but left the original in `Remote-Party-ID` would pass the first check and fail
+this one.
+
+**Criterion 12b is the inverse of the old caller-ID tests.** It sends
+`0000000000` and requires the call to **complete**. Before, that was a 403 and
+a lost call; now it completes on one of our DIDs with a WARNING logged. The
+test asserts all three: the call answered, a DID was asserted, and
+`SBC-CID-INVALID` was logged. Dropping the warning would be as much a failure
+as dropping the call.
+
+**Criterion 14 is literal.** `dids.test.csv` gives NPA 989 exactly one number
+and the test config sets `DID_DAILY_CAP=5`, so "the 6th call that would use
+that DID selects a different one" is reachable in six calls rather than 201.
+The test reads the `did=` field from six consecutive `SBC-DIAL` lines and
+requires the first five to be identical and the sixth to differ.
+
+**Criterion 16 checks longest-prefix-wins, not just rejection.**
+`blocklist.test.csv` deliberately contains both `1712555` ($0.270) and
+`1712555012` ($1.410). A call to `17125550123` matches both, and the test
+requires the log to report the **longer** one. If Asterisk's matcher preferred
+the shorter pattern, every narrow expensive row in a real rate deck would be
+shadowed by a broad cheap one and the blocklist would quietly under-report.
+Rejection alone would not catch that.
+
+**Criteria 13 and 17 are measured from the same 1000-call run**, entirely from
+the CDR. They are two questions about one mechanism and placing 1600 calls to
+answer them separately would only add time.
+
+- **13** asserts no DID exceeded `DID_DAILY_CAP` and that within each NPA pool
+  the busiest and quietest DID differ by at most 1 call. Round-robin over an
+  uncapped pool should differ by exactly 0 or 1; the assertion allows 3.
+- **17** asserts all six gateways took traffic and the spread is within 5% of
+  the mean. **The "all six" half is the important one** — a broken rotation
+  that buckets by wall-clock second, or one derived from `${UNIQUEID}`, still
+  produces a plausible-looking even split across a *subset* of gateways.
+
+The volume phase swaps in `uas-fractel-stub-fast.xml` and
+`uac-invite-fast.xml`. The normal fixtures hold each call for 20 seconds
+against a concurrency cap of 10; 1000 of those would take over half an hour
+and spend most of it refused with `CONCURRENCY_CAP`. Note that sipp's `-d`
+only affects `<pause>` elements that have **no** `milliseconds` attribute of
+their own, so it cannot shorten `uac-invite.xml` — hence a separate scenario
+rather than a flag.
+
 ---
 
 ## What SKIPs and why
@@ -178,7 +273,10 @@ as the RTP source on the real internet — that is manual, in RUNBOOK.md.
 | **crit 3b** — host firewall | on-box traffic never reaches the WAN interface. `nmap` from elsewhere. |
 | **crit 11** — reboot | a test run cannot reboot the host it is running on. |
 | **two-way audio** | needs the real customer and the real carrier. The stub echoes RTP; it does not prove a human can hear a human. |
-| **STIR/SHAKEN attestation** | FracTEL signs. Customer-supplied CID gets **B** attestation, which is correct and expected — A is only for CID that is a FracTEL DID. Nothing on this box changes that. |
+| **cid / cid-empty** | those test the 403 rejection path, which is no longer the default. They SKIP while `VALIDATE_CALLERID=false` and tell you how to run them. Criteria 12 and 12b cover the behaviour that *is* default. |
+| **STIR/SHAKEN attestation** | FracTEL signs, and this suite has no FracTEL. Now that the asserted number is one of our DIDs rather than customer-supplied, **A-level attestation becomes possible** where it was previously B — but whether FracTEL grants it depends on their provisioning, not on this box. Confirm on the first live call. |
+| **FracTEL accepting our DIDs** | the stub answers anything. Whether the carrier accepts these specific numbers as caller ID on this subaccount is a provisioning question and only the live trunk answers it. |
+| **LRN-based cost control** | the blocklist matches the number *dialled*. Whether a given number has been ported into an expensive prefix cannot be known without an LNP dip, which this box does not do. See README.md. |
 
 ---
 

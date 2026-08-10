@@ -40,6 +40,19 @@ STUB_PORT="${_STUB##*:}"
 CAP="${MAX_CONCURRENT_PER_IP:-3}"
 CPS="${MAX_CPS:-5}"
 CDR_CSV_PATH="${CDR_CSV_PATH:-/var/log/asterisk/cdr-custom/sbc.csv}"
+DID_CAP="${DID_DAILY_CAP:-200}"
+VOL_CALLS="${ACCEPT_VOLUME_CALLS:-1000}"
+VOL_CPS="${ACCEPT_VOLUME_CPS:-12}"
+
+# Every gateway, as ip[:port]. Criterion 17 needs one stub per entry — with a
+# single gateway the round-robin is unprovable and could be silently broken.
+GW_LIST=()
+IFS=',' read -r -a _gwraw <<< "${FRACTEL_PROXY_IPS:-}"
+for _g in "${_gwraw[@]}"; do
+  _g="$(echo "$_g" | tr -d '[:space:]')"
+  [[ -n "$_g" ]] && GW_LIST+=("$_g")
+done
+GW_COUNT="${#GW_LIST[@]}"
 
 mkdir -p "$LOGDIR"
 rm -f "$LOGDIR"/*.out "$LOGDIR"/*.err "$LOGDIR"/*.msg 2>/dev/null
@@ -78,9 +91,52 @@ seen_code() {
     | awk '{print $2}' | grep -v '^100$' | tail -1
 }
 
+# --- FracTEL stub farm ----------------------------------------------------
+# One stub per gateway. -trace_msg on every one of them is what makes
+# criterion 12 possible: the INVITE the SBC actually sent toward the carrier
+# is the only place the rewritten From / PAI / RPID can be observed, and it
+# is not visible from the customer side at all.
+start_stubs() { # start_stubs <scenario> [extra sipp args...]
+  local sf="$1"; shift
+  local i=0 g ip port
+  rm -f "$LOGDIR"/stub*.msg "$LOGDIR"/stub*.out 2>/dev/null
+  for g in "${GW_LIST[@]}"; do
+    i=$((i + 1))
+    ip="${g%%:*}"; port="${g##*:}"
+    [[ "$port" == "$g" ]] && port=5060
+    sipp -sf "$SIPP_DIR/$sf" -i "$ip" -p "$port" -nostdin -bg \
+         -trace_msg -message_file "$LOGDIR/stub$i.msg" \
+         "$@" >"$LOGDIR/stub$i.out" 2>&1
+  done
+  sleep 2
+  pgrep -fc 'uas-fractel-stub' 2>/dev/null || echo 0
+}
+
+stop_stubs() {
+  pkill -f 'uas-fractel-stub' 2>/dev/null
+  sleep 1
+  return 0
+}
+
+# The INVITE block the SBC sent toward a given destination. sipp's message
+# file separates messages with a rule of dashes.
+outbound_invite() { # outbound_invite <destination-number>
+  cat "$LOGDIR"/stub*.msg 2>/dev/null | awk -v want="INVITE sip:$1" '
+    /^-{5,}/ { if (buf ~ want) last=buf; buf=""; next }
+    { buf = buf $0 "\n" }
+    END { if (buf ~ want) last=buf; printf "%s", last }'
+}
+
+# Which DID the dialplan says it selected for a destination, from SBC-DIAL.
+did_for() { # did_for <mark> <destination-number>
+  since "$1" | grep 'SBC-DIAL ' | grep -F "dst=$2 " \
+    | sed -n 's/.*[ ]did=\([0-9]\{1,\}\).*/\1/p' | tail -1
+}
+
 cleanup() {
   [[ -n "${STUB_PID:-}" ]] && kill "$STUB_PID" 2>/dev/null
   [[ -n "${HOLD_PID:-}" ]] && kill "$HOLD_PID" 2>/dev/null
+  [[ -n "${VOL_PID:-}"  ]] && kill "$VOL_PID"  2>/dev/null
   pkill -f 'uas-fractel-stub' 2>/dev/null
   "$ROOT/killswitch.sh" off >/dev/null 2>&1
   wait 2>/dev/null
@@ -114,15 +170,29 @@ if ! asterisk -rx "pjsip show identifies" 2>/dev/null | grep -q "$PK1"; then
 fi
 [[ -r "$AST_LOG" ]] || { echo "cannot read $AST_LOG"; exit 1; }
 
-# --- start the FracTEL stub ----------------------------------------------
-sipp -sf "$SIPP_DIR/uas-fractel-stub.xml" -i "$STUB_IP" -p "$STUB_PORT" \
-     -rtp_echo -nostdin -bg >"$LOGDIR/stub.out" 2>&1
-sleep 2
-if ! pgrep -f 'uas-fractel-stub' >/dev/null; then
-  echo "${RED}the FracTEL stub failed to start${NC} — see $LOGDIR/stub.out"
+# --- DID counters ---------------------------------------------------------
+# Per-DID daily counters live in the Asterisk database and persist across
+# restarts BY DESIGN — that is the whole point of the cap. Which means a
+# second run of this suite would start with the first run's counts still
+# there, and criterion 14 (drive one DID to its cap in 6 calls) would behave
+# differently every time.
+#
+# So the suite zeroes them. This is safe here and nowhere else: the preflight
+# above has already established that the trunk points at the local stub, so
+# this is not a box carrying customer traffic.
+if [[ -x "$ROOT/didctl.sh" ]]; then
+  "$ROOT/didctl.sh" reset --all --force >/dev/null 2>&1
+  note "DID daily counters cleared for today (test config only)"
+fi
+
+# --- start the FracTEL stub farm -----------------------------------------
+UP="$(start_stubs uas-fractel-stub.xml -rtp_echo)"
+if [[ "${UP:-0}" -lt "$GW_COUNT" ]]; then
+  echo "${RED}only ${UP:-0} of $GW_COUNT FracTEL stubs started${NC} — see $LOGDIR/stub*.out"
+  echo "each gateway in FRACTEL_PROXY_IPS needs its own bindable address"
   exit 1
 fi
-note "fractel stub up on $STUB_IP:$STUB_PORT"
+note "$GW_COUNT fractel stub(s) up: ${GW_LIST[*]}"
 sleep "${FRACTEL_QUALIFY_FREQ:-15}"   # let one qualify round land so crit 1 can see Avail
 echo
 
@@ -141,8 +211,14 @@ if [[ -n "$MISSING" ]]; then
 elif [[ "${AVAIL:-0}" -lt 1 ]]; then
   fail "crit 1" "endpoints present but no FracTEL gateway is Avail"
   note "$(head -3 <<< "$CONTACTS")"
+elif [[ "${AVAIL:-0}" -lt "$GW_COUNT" ]]; then
+  # Not fatal for criteria 1-11, but criterion 17 measures distribution across
+  # all of them and would silently measure a smaller set.
+  fail "crit 1" "only $AVAIL of $GW_COUNT FracTEL gateways are Avail"
+  note "criterion 17 cannot measure distribution across gateways that are down"
+  note "$(head -3 <<< "$CONTACTS")"
 else
-  pass "crit 1" "pkclient1, pkclient2 and fractel gateways present; $AVAIL gateway(s) Avail"
+  pass "crit 1" "pkclient1, pkclient2 and all $GW_COUNT fractel gateways present and Avail"
 fi
 
 # ===========================================================================
@@ -415,24 +491,311 @@ note "reboot the host, then: systemctl is-active asterisk nftables; ./firewall.s
 note "RUNBOOK.md has the full checklist."
 
 # ===========================================================================
-# Caller ID validation (not a numbered criterion, but it is what stops
-# unanswerable tracebacks)
+# Caller ID REJECTION (the old behaviour, now off by default)
 # ===========================================================================
-M="$(mark)"
-ROWS="$(($(grep -vc '^SEQUENTIAL' "$SIPP_DIR/destinations-badcid.csv")))"
-if sipp_run badcid uac-expect-403-badcid.xml destinations-badcid.csv "$PK1" 5061 -m "$ROWS" -r 2; then
-  R="$(count_rej "$M" BAD_CALLERID)"
-  pass "cid" "all $ROWS malformed caller IDs refused with 403 (BAD_CALLERID x$R)"
-  note "covers alpha, too-short, self-dial, and invalid-NPA caller IDs"
+# VALIDATE_CALLERID=false is the production default: the customer's caller ID
+# is discarded and replaced on every call, so refusing traffic over it costs
+# revenue and protects nothing. Criteria 12 and 12b below test what happens
+# instead. These two tests exercise the 403 path that is still in the
+# dialplan for operators who want it, and they SKIP rather than pass when it
+# is not the configured behaviour.
+if [[ "${VALIDATE_CALLERID:-false}" != "true" ]]; then
+  skip "cid" "VALIDATE_CALLERID=false — malformed caller ID is logged, not refused"
+  note "that is the default and criteria 12/12b prove the replacement works."
+  note "to exercise the 403 path instead:"
+  note "  sed -i 's/^VALIDATE_CALLERID=.*/VALIDATE_CALLERID=true/' $CONF"
+  note "  sudo $HERE/testenv.sh apply && sudo $HERE/run-acceptance.sh"
+  skip "cid-empty" "same reason"
 else
-  fail "cid" "a malformed caller ID was accepted — see $LOGDIR/badcid.msg"
+  M="$(mark)"
+  ROWS="$(($(grep -vc '^SEQUENTIAL' "$SIPP_DIR/destinations-badcid.csv")))"
+  if sipp_run badcid uac-expect-403-badcid.xml destinations-badcid.csv "$PK1" 5061 -m "$ROWS" -r 2; then
+    R="$(count_rej "$M" BAD_CALLERID)"
+    pass "cid" "all $ROWS malformed caller IDs refused with 403 (BAD_CALLERID x$R)"
+    note "covers alpha, too-short, self-dial, and invalid-NPA caller IDs"
+  else
+    fail "cid" "a malformed caller ID was accepted — see $LOGDIR/badcid.msg"
+  fi
+
+  M="$(mark)"
+  if sipp_run emptycid uac-empty-cid.xml destinations.csv "$PK1" 5061 -m 1; then
+    pass "cid-empty" "INVITE with no From user part refused with 403"
+  else
+    fail "cid-empty" "empty caller ID was accepted"
+  fi
 fi
 
+# ===========================================================================
+# Criterion 12 — the customer's caller ID does not leave this box
+# ===========================================================================
+# The only place this can be observed is the INVITE the SBC sent toward the
+# carrier. Nothing on the customer leg shows it, and the CDR records what we
+# INTENDED to send. The stubs run with -trace_msg for exactly this.
+CUST_CID=2125551234
+DEST12=12125550111
 M="$(mark)"
-if sipp_run emptycid uac-empty-cid.xml destinations.csv "$PK1" 5061 -m 1; then
-  pass "cid-empty" "INVITE with no From user part refused with 403"
+if ! sipp_run cid12 uac-invite.xml destinations-cidrewrite.csv "$PK1" 5061 -m 1 -d 3000; then
+  fail "crit 12" "the call did not complete — cannot inspect the outbound INVITE"
+  note "see $LOGDIR/cid12.msg"
 else
-  fail "cid-empty" "empty caller ID was accepted — this is what makes a traceback unanswerable"
+  DID12="$(did_for "$M" "$DEST12")"
+  INV12="$(outbound_invite "$DEST12")"
+  if [[ -z "$INV12" ]]; then
+    fail "crit 12" "no INVITE toward $DEST12 found in any stub trace"
+  elif [[ -z "$DID12" ]]; then
+    fail "crit 12" "no SBC-DIAL line recorded a selected DID"
+  else
+    F_FROM="$(grep -i '^From:' <<< "$INV12" | head -1)"
+    F_PAI="$(grep  -i '^P-Asserted-Identity:' <<< "$INV12" | head -1)"
+    F_RPID="$(grep -i '^Remote-Party-ID:'     <<< "$INV12" | head -1)"
+    BAD=""
+    grep -q "$DID12" <<< "$F_FROM"  || BAD+="From "
+    [[ -n "$F_PAI"  ]] && grep -q "$DID12" <<< "$F_PAI"  || BAD+="P-Asserted-Identity "
+    [[ -n "$F_RPID" ]] && grep -q "$DID12" <<< "$F_RPID" || BAD+="Remote-Party-ID "
+    # The real assertion: their number is nowhere in the message at all.
+    LEAK="$(grep -c "$CUST_CID" <<< "$INV12" || true)"
+
+    if [[ -z "$BAD" && "$LEAK" -eq 0 ]]; then
+      pass "crit 12" "From, P-Asserted-Identity and Remote-Party-ID all carry our DID"
+      note "customer sent <CUST_CID>; outbound INVITE asserts $DID12 in all three headers"
+      note "the customer's value appears 0 times in the outbound INVITE"
+      note "$(sed 's/^[[:space:]]*//' <<< "$F_FROM")"
+      note "$(sed 's/^[[:space:]]*//' <<< "${F_PAI:-P-Asserted-Identity: (ABSENT)}")"
+      note "$(sed 's/^[[:space:]]*//' <<< "${F_RPID:-Remote-Party-ID: (ABSENT)}")"
+    elif [[ "$LEAK" -gt 0 ]]; then
+      fail "crit 12" "the customer's caller ID LEAKED into the outbound INVITE ($LEAK occurrence(s))"
+      note "$(grep -n "$CUST_CID" <<< "$INV12" | head -3)"
+    else
+      fail "crit 12" "header(s) not carrying our DID: $BAD"
+      note "expected $DID12"
+      note "${F_FROM:-From: (absent)}"
+      note "${F_PAI:-P-Asserted-Identity: (absent — check send_pai on the fractel endpoint)}"
+      note "${F_RPID:-Remote-Party-ID: (absent — check send_rpid on the fractel endpoint)}"
+    fi
+  fi
+fi
+
+# ===========================================================================
+# Criterion 12b — a malformed caller ID is REPLACED, not refused
+# ===========================================================================
+# This is the behaviour change. Before, 0000000000 got a 403 and the call was
+# lost. Now the call completes on one of our DIDs and the operator gets a
+# WARNING telling them the customer's dialer is misbehaving.
+DEST12B=13105550112
+M="$(mark)"
+if ! sipp_run cid12b uac-invite.xml destinations-cidbad.csv "$PK1" 5061 -m 1 -d 3000; then
+  fail "crit 12b" "call with caller ID 0000000000 did NOT complete"
+  note "if it was refused with 403, VALIDATE_CALLERID is true — see $LOGDIR/cid12b.msg"
+else
+  DID12B="$(did_for "$M" "$DEST12B")"
+  W12B="$(since "$M" | grep -c 'SBC-CID-INVALID' || true)"
+  INV12B="$(outbound_invite "$DEST12B")"
+  LEAK12B="$(grep -c '0000000000' <<< "$INV12B" || true)"
+
+  if [[ -n "$DID12B" && "$W12B" -ge 1 && "$LEAK12B" -eq 0 ]]; then
+    pass "crit 12b" "malformed CID 0000000000 replaced with $DID12B; call completed; WARN logged"
+    note "$(since "$M" | grep 'SBC-CID-INVALID' | tail -1 | sed 's/.*SBC-CID/SBC-CID/')"
+  elif [[ "$W12B" -lt 1 ]]; then
+    fail "crit 12b" "call completed but no SBC-CID-INVALID warning was logged"
+    note "the replacement works; the early-warning signal does not"
+  elif [[ "$LEAK12B" -gt 0 ]]; then
+    fail "crit 12b" "0000000000 leaked into the outbound INVITE"
+  else
+    fail "crit 12b" "call completed but no DID was recorded as selected"
+  fi
+fi
+
+# ===========================================================================
+# Criterion 14 — per-DID daily cap takes a number out of rotation
+# ===========================================================================
+# NPA 989 holds exactly one DID in dids.test.csv and DID_DAILY_CAP is 5, so
+# the 6th call into 989 cannot use it. Counters were zeroed at startup.
+if [[ "$DID_CAP" -gt 20 ]]; then
+  skip "crit 14" "DID_DAILY_CAP=$DID_CAP — too high to reach in a test run"
+  note "set DID_DAILY_CAP=5 in $CONF (the shipped test config does)"
+else
+  DEST14=19895550111
+  "$ROOT/didctl.sh" reset --all --force >/dev/null 2>&1
+  M="$(mark)"
+  sipp_run cap14 uac-invite-fast.xml destinations-cap.csv "$PK1" 5061 -m $((DID_CAP + 1)) -r 1
+  sleep 2
+  SEQ="$(since "$M" | grep 'SBC-DIAL ' | grep -F "dst=$DEST14 " \
+         | sed -n 's/.*[ ]did=\([0-9]\{1,\}\).*/\1/p')"
+  NSEQ="$(wc -l <<< "$SEQ")"
+  FIRST="$(head -1 <<< "$SEQ")"
+  LAST="$(tail -1 <<< "$SEQ")"
+  ONCAP="$(grep -c "^$FIRST\$" <<< "$SEQ" || true)"
+  OVF14="$(since "$M" | grep -c 'SBC-DID-OVERFLOW' || true)"
+
+  if [[ "$NSEQ" -lt $((DID_CAP + 1)) ]]; then
+    fail "crit 14" "only $NSEQ of $((DID_CAP + 1)) calls reached DID selection"
+    note "$(since "$M" | grep 'SBC-REJECT' | tail -2)"
+  elif [[ "$ONCAP" -eq "$DID_CAP" && "$LAST" != "$FIRST" && "$OVF14" -ge 1 ]]; then
+    pass "crit 14" "with cap=$DID_CAP, calls 1-$DID_CAP used $FIRST and call $((DID_CAP + 1)) selected $LAST instead"
+    note "the capped number went out of rotation and the overflow pool took the call (WARN logged)"
+  elif [[ "$LAST" == "$FIRST" ]]; then
+    fail "crit 14" "call $((DID_CAP + 1)) reused $FIRST — the cap is NOT enforced in the call path"
+  else
+    fail "crit 14" "unexpected selection sequence: $(tr '\n' ' ' <<< "$SEQ")"
+  fi
+fi
+
+# ===========================================================================
+# Criterion 15 — an NPA with no pool falls to overflow and logs WARN
+# ===========================================================================
+DEST15=15055550101
+M="$(mark)"
+if ! sipp_run ovf15 uac-invite-fast.xml destinations-overflow.csv "$PK1" 5061 -m 1; then
+  fail "crit 15" "the call to an unpooled NPA did not complete"
+  note "see $LOGDIR/ovf15.msg"
+else
+  DID15="$(did_for "$M" "$DEST15")"
+  W15="$(since "$M" | grep 'SBC-DID-OVERFLOW' | grep -c 'dst_npa=505' || true)"
+  R15="$(since "$M" | grep 'SBC-DIAL ' | grep -F "dst=$DEST15 " \
+         | sed -n 's/.*didreason=\([a-z_]*\).*/\1/p' | tail -1)"
+  if [[ "$W15" -ge 1 && "$R15" == "overflow" && -n "$DID15" ]]; then
+    pass "crit 15" "NPA 505 has no pool: selected $DID15 from overflow and logged WARN"
+    note "$(since "$M" | grep 'SBC-DID-OVERFLOW' | tail -1 | sed 's/.*SBC-DID/SBC-DID/')"
+  elif [[ "$W15" -lt 1 ]]; then
+    fail "crit 15" "call used overflow but no WARN was logged (reason=$R15)"
+  else
+    fail "crit 15" "expected did_selection_reason=overflow, got '$R15'"
+  fi
+fi
+
+# ===========================================================================
+# Criterion 16 — high-cost prefixes are refused with 503
+# ===========================================================================
+M="$(mark)"
+ROWS16="$(($(grep -vc '^SEQUENTIAL' "$SIPP_DIR/destinations-blocked.csv")))"
+if sipp_run blocked uac-expect-503.xml destinations-blocked.csv "$PK1" 5061 -m "$ROWS16" -r 2; then
+  R16="$(count_rej "$M" HIGH_COST_PREFIX)"
+  # 17125550123 matches both 1712555 ($0.270) and 1712555012 ($1.410).
+  # Asterisk must pick the more specific pattern or the deck's narrow rows
+  # are silently overridden by its broad ones.
+  LONGEST="$(since "$M" | grep 'HIGH_COST_PREFIX' | grep -F 'dst=17125550123' \
+             | sed -n 's/.*prefix=\([0-9]*\).*/\1/p' | tail -1)"
+  if [[ "$R16" -ge "$ROWS16" && "$LONGEST" == "1712555012" ]]; then
+    pass "crit 16" "all $ROWS16 blocklisted destinations refused with 503 (HIGH_COST_PREFIX x$R16)"
+    note "longest-prefix match confirmed: 17125550123 matched 1712555012 (\$1.410), not 1712555 (\$0.270)"
+    note "$(since "$M" | grep 'HIGH_COST_PREFIX' | tail -1 | sed 's/.*SBC-REJECT/SBC-REJECT/')"
+  elif [[ "$R16" -lt "$ROWS16" ]]; then
+    fail "crit 16" "only $R16 of $ROWS16 blocklisted destinations were refused"
+  else
+    fail "crit 16" "longest-prefix match is wrong: 17125550123 matched '${LONGEST:-nothing}', expected 1712555012"
+    note "the broad rate-deck rows are shadowing the narrow ones — every"
+    note "narrower, more expensive prefix in blocklist.csv is being ignored"
+  fi
+else
+  fail "crit 16" "a blocklisted destination was NOT refused — see $LOGDIR/blocked.msg"
+fi
+
+# ===========================================================================
+# Criteria 13 and 17 — DID and gateway distribution under volume
+# ===========================================================================
+# Both are measured from the SAME run: they are two questions about one
+# mechanism, and placing 1600 calls to answer them separately would only add
+# time. Everything asserted below comes out of the CDR, which is the
+# requirement — distribution has to be provable from the record.
+echo
+note "criteria 13/17: placing $VOL_CALLS calls at ${VOL_CPS}/s (about $((VOL_CALLS / VOL_CPS))s)"
+if [[ "$VOL_CPS" -ge "$CPS" ]]; then
+  note "${YEL}WARNING${NC}: ACCEPT_VOLUME_CPS=$VOL_CPS is not below MAX_CPS=$CPS."
+  note "the CPS limiter will refuse part of the run and the sample will be smaller than $VOL_CALLS."
+fi
+
+"$ROOT/didctl.sh" reset --all --force >/dev/null 2>&1
+stop_stubs
+UPF="$(start_stubs uas-fractel-stub-fast.xml)"
+if [[ "${UPF:-0}" -lt "$GW_COUNT" ]]; then
+  fail "crit 13" "only ${UPF:-0} of $GW_COUNT fast stubs started"
+  fail "crit 17" "same"
+else
+  sleep "${FRACTEL_QUALIFY_FREQ:-15}"
+  CDR_BEFORE="$(wc -l < "$CDR_CSV_PATH" 2>/dev/null || echo 0)"
+  M="$(mark)"
+  sipp -sf "$SIPP_DIR/uac-invite-fast.xml" -inf "$SIPP_DIR/destinations-volume.csv" \
+       -i "$PK1" -p 5065 -m "$VOL_CALLS" -r "$VOL_CPS" -rp 1s \
+       -nostdin -timeout 600 >"$LOGDIR/volume.out" 2>&1
+  sleep 6
+
+  VOL_CSV="$LOGDIR/volume-cdr.csv"
+  tail -n +$((CDR_BEFORE + 1)) "$CDR_CSV_PATH" 2>/dev/null > "$VOL_CSV"
+  VROWS="$(wc -l < "$VOL_CSV")"
+
+  # --- criterion 13: no DID over its cap, even spread within each pool ----
+  read -r WITHDID MAXCNT NPOOLS WORSTSPREAD WORSTNPA <<< "$(awk '
+    function csvsplit(line, arr,   i,n,c,f,q,L) {
+      n=0; f=""; q=0; L=length(line)
+      for (i=1;i<=L;i++) { c=substr(line,i,1)
+        if (q) { if (c=="\"") { if (substr(line,i+1,1)=="\"") { f=f "\""; i++ } else q=0 } else f=f c }
+        else { if (c=="\"") q=1; else if (c==",") { arr[++n]=f; f="" } else f=f c } }
+      arr[++n]=f; return n }
+    { n=csvsplit($0,f); if (n<19) next
+      did=f[16]; npa=f[18]; cnt=f[19]+0
+      if (did=="") next
+      withdid++
+      if (cnt>maxcnt) maxcnt=cnt
+      use[npa "\t" did]++; seen[npa]=1 }
+    END {
+      worst=0; worstnpa="-"; npools=0
+      for (p in seen) {
+        lo=-1; hi=0; c=0
+        for (k in use) { split(k,a,"\t"); if (a[1]!=p) continue
+          v=use[k]; c++; if (lo<0 || v<lo) lo=v; if (v>hi) hi=v }
+        if (c<2) continue
+        npools++
+        d = hi-lo
+        if (d>worst) { worst=d; worstnpa=p }
+      }
+      print withdid+0, maxcnt+0, npools+0, worst+0, worstnpa }' "$VOL_CSV")"
+
+  if [[ "$VROWS" -lt 1 ]]; then
+    fail "crit 13" "no CDR rows were produced by the volume run"
+  elif [[ "$MAXCNT" -gt "$DID_CAP" ]]; then
+    fail "crit 13" "a DID reached $MAXCNT calls against a cap of $DID_CAP"
+    note "the cap is not holding under concurrency — check func_lock is loaded"
+  elif [[ "$WORSTSPREAD" -gt 3 ]]; then
+    fail "crit 13" "uneven distribution: NPA $WORSTNPA has a $WORSTSPREAD-call gap between its busiest and quietest DID"
+    note "round-robin over an uncapped pool should differ by at most 1"
+  else
+    pass "crit 13" "$WITHDID call(s) over $NPOOLS pool(s): no DID exceeded $DID_CAP (worst $MAXCNT), widest in-pool gap $WORSTSPREAD call(s)"
+    note "$VROWS CDR row(s) written; $((VOL_CALLS - VROWS)) call(s) not recorded (throttled or not placed)"
+  fi
+
+  # --- criterion 17: gateway distribution ---------------------------------
+  read -r NGW GLO GHI GAVG <<< "$(awk '
+    function csvsplit(line, arr,   i,n,c,f,q,L) {
+      n=0; f=""; q=0; L=length(line)
+      for (i=1;i<=L;i++) { c=substr(line,i,1)
+        if (q) { if (c=="\"") { if (substr(line,i+1,1)=="\"") { f=f "\""; i++ } else q=0 } else f=f c }
+        else { if (c=="\"") q=1; else if (c==",") { arr[++n]=f; f="" } else f=f c } }
+      arr[++n]=f; return n }
+    { n=csvsplit($0,f); if (n<19) next; g=f[12]; if (g!="") gw[g]++ }
+    END { lo=-1; hi=0; s=0; c=0
+      for (g in gw) { c++; s+=gw[g]; if (lo<0 || gw[g]<lo) lo=gw[g]; if (gw[g]>hi) hi=gw[g] }
+      printf "%d %d %d %.1f\n", c, (lo<0?0:lo), hi, (c?s/c:0) }' "$VOL_CSV")"
+
+  GTOL="$(awk -v a="$GAVG" 'BEGIN{t=a*0.05; if (t<2) t=2; printf "%d", t}')"
+  GSPREAD=$((GHI - GLO))
+  if [[ "$NGW" -lt "$GW_COUNT" ]]; then
+    fail "crit 17" "only $NGW of $GW_COUNT gateways took traffic"
+    note "$(awk -F'","' '{print $12}' "$VOL_CSV" | sort | uniq -c | sort -rn | head -8 | tr '\n' ' ')"
+    note "gateway selection is bucketing instead of rotating per call"
+  elif [[ "$GSPREAD" -gt "$GTOL" ]]; then
+    fail "crit 17" "uneven across gateways: min $GLO max $GHI (avg $GAVG, tolerance $GTOL)"
+  else
+    pass "crit 17" "traffic spread across all $NGW gateways: min $GLO, max $GHI, avg $GAVG"
+    note "round-robin is per call, not per second — a wall-clock bucket would"
+    note "have stacked every call in a given second onto one gateway"
+  fi
+
+  # Evidence for the RUNBOOK, computed from the CDR alone.
+  echo
+  "$ROOT/didctl.sh" distribution "$VOL_CSV" 2>/dev/null | sed 's/^/  /'
+
+  stop_stubs
+  start_stubs uas-fractel-stub.xml -rtp_echo >/dev/null
 fi
 
 # ===========================================================================
@@ -445,6 +808,12 @@ echo
 echo "  ${YEL}The skips are not passes.${NC} Criterion 3b (host firewall) and criterion 11"
 echo "  (reboot) are the two that have bitten real deployments, and neither can be"
 echo "  proven from this box. Do them by hand before the customer test."
+echo
+echo "  Criterion 12 was checked against a SIPp stub, not FracTEL. It proves the"
+echo "  INVITE leaving this box carries our DID in all three identity headers and"
+echo "  none of the customer's value. It does NOT prove what FracTEL attests off,"
+echo "  or that they accept our numbers on this subaccount. Those need the live"
+echo "  trunk — RUNBOOK.md has the steps."
 echo
 echo "  Put production config back:  sudo $HERE/testenv.sh restore"
 echo

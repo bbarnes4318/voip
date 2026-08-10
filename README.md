@@ -49,10 +49,14 @@ permitted. No single point of failure.
 | 2 | SIP ACL | `[sbc-acl]` + `type=identify` in `pjsip.conf` | `deny=0.0.0.0/0.0.0.0` first, explicit permits after; `endpoint_identifier_order=ip` and `identify_by=ip` mean a source cannot claim an identity in a header |
 | 3 | Dialplan | `[sbc-customer]` in `extensions.conf` | one `Dial()` target, no includes, no `Local/`, and `res_agi`/`app_system`/`func_shell`/`app_originate` are not loaded |
 
-The dialplan checks, in order: killswitch → destination allowlist → caller ID
-→ CPS → concurrency → dial. Destination is validated *before* a concurrency
-slot is consumed, so a flood of junk destinations cannot starve legitimate
-traffic out of the cap.
+The dialplan checks, in order: killswitch → destination allowlist → high-cost
+prefix blocklist → caller ID (advisory) → CPS → concurrency → **DID selection
+and daily cap** → **caller ID assignment** → dial.
+
+Destination is validated *before* a concurrency slot is consumed, so a flood
+of junk destinations cannot starve legitimate traffic out of the cap. DID
+selection happens *after* the CPS and concurrency checks, so a call that is
+about to be throttled never burns a number's daily allowance.
 
 Every rejection logs `SBC-REJECT reason=<REASON>` with the source IP, caller
 ID, destination and Call-ID.
@@ -86,36 +90,170 @@ its own budget. Over-cap gets 503 and a loud NOTICE.
 combined — FracTEL's fraud system reacts to the aggregate arriving from our
 one source address, not per-endpoint.
 
-**Caller ID validation** (`VALIDATE_CALLERID=true`, default on). Rejects
-empty, alphabetic, shorter than 10 digits, invalid NPA, or CID identical to
-the destination — with **403**, not 503, so a dialer treats it as "fix your
-config" rather than "retry later". The CID itself is passed through
-byte-for-byte and is never rewritten or invented (`NORMALIZE_CALLERID=false`
-by default). It is logged on every call.
+**High-cost prefix blocklist** — the primary cost control. See
+[Caller ID and cost control](#caller-id-is-assigned-by-this-box) below.
 
-On attestation: FracTEL signs, and customer-supplied CID gets **B**
-attestation. That is correct and expected — A is only for CID that is a
-FracTEL DID. Nothing here attempts to force A, and nothing should.
+## Caller ID is assigned by this box
+
+**The customer does not set caller ID. Their value is discarded on every
+call.**
+
+This reverses the original design, and the reversal is the reason this
+version exists. A customer's ViciDial put **50,864 calls on a single DID in
+one afternoon** and tripped a carrier fraud alert. Their dialer matched caller
+ID to destination area code and silently fell back to one default number when
+no match existed. Caller ID is no longer theirs to get wrong.
+
+On every outbound INVITE toward FracTEL, three headers are set to the DID this
+box selected:
+
+| Header | Set by |
+|---|---|
+| `From` | `CALLERID(num)` in the dialplan |
+| `P-Asserted-Identity` | `send_pai=yes` + `trust_id_outbound=yes` |
+| `Remote-Party-ID` | `send_rpid=yes` |
+
+All three come from one variable so they cannot disagree. FracTEL most likely
+attests off `From` alone, but a leak in any one of them could key attestation
+to the wrong number, and the traceback would come back here.
+
+**If the selected DID is empty or malformed the call is refused with 503 and
+an ERROR is logged.** There is no path that falls back to what the customer
+sent. That guard, not the input validation, is what makes this structural.
+
+### Selection
+
+`dids.csv` maps destination NPA → DIDs we own. Per call:
+
+1. Destination NPA has a pool → rotate within it.
+2. It does not, or every DID in it is capped for the day → rotate within
+   **OVERFLOW**, log WARN.
+3. OVERFLOW is capped out too → refuse with 503, log ERROR.
+
+**There is no single default number anywhere in that path.** The OVERFLOW pool
+must hold at least 20 numbers (`OVERFLOW_MIN`) and `render.sh` refuses to
+render below it — a thin overflow pool degrades into exactly the
+single-number behaviour that caused the incident.
+
+Rotation is a per-pool counter advanced once per call, so successive calls
+into an NPA take successive numbers and the DID chosen is always the one used
+longest ago. It is deliberately **not random**: random clusters, and over a
+few hundred calls some numbers take three times the traffic of others.
+
+### Per-DID daily cap
+
+`DID_DAILY_CAP` (default 200) calls per number per **local** day, enforced in
+the call path — not in a report the next morning. Counters live in the
+Asterisk database keyed `sbc/didcnt/<YYYYMMDD>/<did>`, so they survive a
+restart and roll over at midnight with no reset job that can fail.
+
+The check is a read-modify-write, so it takes a lock — scoped to the
+**individual DID**, not globally. Two calls contend only when competing for
+the same number, which with rotation working is rare. On lock timeout the call
+**proceeds** and logs WARNING: undercounting one call against a safety limit
+beats dropping a billable one. That is the one place in the call path that
+fails open, and it is deliberate.
+
+`./didctl.sh status` shows today at a glance; `./didctl.sh distribution`
+proves per-DID spread from the CDR alone.
+
+### What the customer sends
+
+Recorded in CDR `caller_id`, logged, and thrown away. `VALIDATE_CALLERID`
+defaults to **false**: refusing a call over a field we never use costs revenue
+and protects nothing. A malformed value gets
+
+```
+WARNING SBC-CID-INVALID ... custcid=<what they sent> src=<their IP> note=discarded-and-replaced
+```
+
+which is the early warning that their dialer has broken. Setting it `true`
+restores the old 403 rejection; the path is still there.
+
+### On attestation
+
+FracTEL signs. Now that the asserted number is a FracTEL DID rather than
+customer-supplied, **A-level attestation becomes possible** where it was
+previously B. Whether FracTEL actually grants it depends on their
+provisioning, not on anything this box does. Confirm it on the first live
+call rather than assuming it.
+
+## Cost control: the high-cost prefix blocklist
+
+`blocklist.csv` holds LRN prefixes at or above a rate threshold. A match is
+refused with 503 and logged at WARN **with the rate**, so the log says what
+the call would have cost.
+
+Do not maintain it by hand. Regenerate it from the carrier rate deck:
+
+```bash
+python3 tools/build-blocklist.py --deck ~/decks/ShortDuration-2026-08.csv --out blocklist.csv
+```
+
+The deck updates monthly; a stale blocklist is a cost control that has quietly
+stopped controlling costs.
+
+Matching is **longest prefix wins** and variable length, so an NPA-wide row and
+a narrow line-range row can coexist and the narrower one takes precedence.
+`render.sh` compiles the file into a generated dialplan context, so the test
+is a single lookup in Asterisk's extension matcher — 1,248 prefixes cost the
+same per INVITE as 12.
+
+### Known limitation, and it is not small
+
+**The deck is LRN-rated. This box has no LRN.**
+
+The real charge follows the LRN — where a number has been *ported to* — not
+the number dialled. The SBC performs no LNP dip and has no LRN at call time,
+so it matches the dialled number.
+
+**It therefore catches numbers natively in expensive prefixes and misses
+numbers ported into them.** This is partial cost control, not complete. Treat
+the blocklist as reducing exposure, not eliminating it.
+
+CDR column 20 (`lrn`) exists for reconciliation against FracTEL's own rated
+CDR. It is **always empty from the SBC** — do not read a populated value there
+as evidence that a dip happened. Prefixes discovered that way get added to
+`blocklist.csv` and are caught from then on.
 
 ## Repo layout
 
 ```
 config.env.example      every placeholder, documented. Copy to config.env.
+dids.csv.example        the DID pool: npa,did. Copy to dids.csv.
+blocklist.csv.example   high-cost prefixes. GENERATED — see tools/ below.
 render.sh               templates -> /etc/asterisk. No IP is hardcoded anywhere else.
 install.sh              idempotent: packages, config, systemd units, validation
 firewall.sh             idempotent nftables, with auto-rollback so you cannot lock yourself out
 killswitch.sh           on | on --hard | off | status | restore
+didctl.sh               DID pool: usage, caps, distribution from the CDR, pruning
 monitor.sh              live: channels, per-IP concurrency, CPS, ASR, ACD
 healthcheck.sh          exit 0/1/2 on trunk and box health; runs on a systemd timer
 
+tools/build-blocklist.py  regenerate blocklist.csv from the carrier rate deck
 asterisk/*.tpl          rendered configs. Only .tpl is tracked; rendered .conf is gitignored.
 tests/                  SIPp scenarios + driver. Read tests/README.md first.
 ```
+
+`config.env`, `dids.csv` and `blocklist.csv` all hold real values and are all
+gitignored. Only the `.example` versions are tracked.
 
 ## Quick start
 
 ```bash
 cp config.env.example config.env && chmod 600 config.env && $EDITOR config.env
+```
+
+```bash
+cp dids.csv.example dids.csv && chmod 600 dids.csv && $EDITOR dids.csv
+```
+
+The example DIDs are 555-01XX fiction numbers. Replace them with the numbers
+you actually own on the FracTEL subaccount, or every call will assert a number
+no carrier will accept. Then generate the blocklist from your rate deck:
+
+```bash
+python3 tools/build-blocklist.py --deck ~/decks/ShortDuration.csv --out blocklist.csv
 ```
 
 ```bash
@@ -142,10 +280,33 @@ CSV alone is sufficient to run the test.
 Column order, defined in `asterisk/cdr_custom.conf.tpl`:
 
 ```
-timestamp_start, timestamp_answer, timestamp_end, source_ip,
-customer_endpoint, caller_id, destination, duration, billsec,
-disposition, hangup_cause, fractel_gateway_used, sip_call_id,
-reject_reason, uniqueid
+ 1 timestamp_start      6 caller_id      11 hangup_cause          16 selected_did
+ 2 timestamp_answer     7 destination    12 fractel_gateway_used  17 did_selection_reason
+ 3 timestamp_end        8 duration       13 sip_call_id           18 destination_npa
+ 4 source_ip            9 billsec        14 reject_reason         19 did_daily_count_at_selection
+ 5 customer_endpoint   10 disposition    15 uniqueid              20 lrn
+```
+
+Columns 16–20 are **appended**, never inserted: 1–15 keep their positions so
+every existing reader keeps working. Column 12 `fractel_gateway_used` **is**
+the gateway column — it is not renamed, because `monitor.sh`, the acceptance
+parser and anything downstream index positionally and a rename breaks them
+all silently.
+
+- **`caller_id`** (6) is what the customer *asked for*. It is discarded.
+- **`selected_did`** (16) is what actually went out, in all three identity
+  headers.
+- **`did_daily_count_at_selection`** (19) includes the call it is on, so a
+  value equal to `DID_DAILY_CAP` means that was the last call the number
+  would take that day.
+- **`lrn`** (20) is **always empty from the SBC**. No LNP dip happens here.
+  It exists so FracTEL's LRN-rated CDR can be joined in downstream.
+
+Per-DID distribution and cap compliance are provable from this file alone,
+which is the point:
+
+```bash
+./didctl.sh distribution
 ```
 
 `billsec` is **raw whole seconds**. It is deliberately not pre-rounded to 6-
@@ -166,6 +327,46 @@ attacker-controlled text that will eventually contain a comma.
 
 These are flagged because each one is a deviation, a cost, or a thing a future
 reader will want to undo without knowing why it is there.
+
+**`render.sh` refuses to render an OVERFLOW pool below 20 numbers.** There is
+no override flag. A small overflow pool works fine right up until an NPA caps
+out, and then it concentrates traffic onto a handful of numbers — which is the
+failure this whole version exists to prevent, arriving by a different route.
+The fix when it fires is to buy more numbers, not to lower `OVERFLOW_MIN`.
+
+**A malformed row in `dids.csv` or `blocklist.csv` is a hard error with a line
+number, not a skipped row.** A silently dropped DID shrinks a pool without
+telling anyone. A silently dropped blocklist row is a prefix you believe is
+blocked and is not. Both fail the render instead.
+
+**The per-DID cap fails OPEN on lock timeout.** Everything else in the call
+path fails closed. This one does not: on ~150ms of contention for a single
+number the call proceeds and logs WARNING rather than being refused.
+Undercounting one call against a 200/day *safety limit* is better than
+dropping a billable call, and the cap is a guard rail rather than a billing
+boundary. If you disagree, the branch to change is `nolock` in `[sbc-did]`.
+
+**Rotation counters are in memory, not in the database.** The per-DID daily
+counter is persisted because it has to survive a restart; the rotation pointer
+is not, because it only has to spread load. Making it durable would put an
+sqlite write in the path of every call for no benefit. A restart re-starts
+rotation at the top of each pool, which is visible as a small transient and
+nothing more.
+
+**Gateway rotation is a per-call counter, not `${UNIQUEID}`.** The obvious
+lock-free trick — take the uniqueid sequence modulo the gateway count — is
+wrong here, and wrong in a way that hides. That sequence increments per
+*channel*, and an answered call allocates two of them (customer leg plus the
+outbound leg toward FracTEL), so customer-leg sequence numbers advance by two.
+With six gateways, `seq % 6` yields three residues and **half the trunk goes
+unused**. The trap is that it works correctly with an *odd* gateway count, so
+it would look fine in a five-gateway test and fail on the sixth.
+
+**`VALIDATE_CALLERID` now defaults to false.** This is the one control that
+was deliberately *loosened*. It stopped being a safety control the moment the
+customer's caller ID stopped reaching FracTEL — it now rejects billable calls
+over a field that is discarded. The signal it provided is preserved as a
+WARNING. The rejection path is still in the dialplan and still works.
 
 **AMI is off entirely, not bound to loopback.** The brief allowed loopback.
 Nothing needs it — `monitor.sh`, `killswitch.sh` and `healthcheck.sh` all use

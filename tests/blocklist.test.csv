@@ -1,0 +1,28 @@
+# ===========================================================================
+# blocklist.test.csv — high-cost prefixes for the acceptance suite.
+#
+# FAKE. The prefixes use the fictional 555 NXX and the rates are invented.
+# Production blocklist.csv is generated from the real rate deck by
+# tools/build-blocklist.py and is gitignored.
+#
+# Chosen so the suite proves the parts that are easy to get wrong:
+#
+#   1252555 / 1531555   plain 7-digit NPA-NXX prefixes, criterion 16.
+#   1712555             7 digits, $0.270
+#   1712555012          10 digits, $1.410 — LONGEST MATCH WINS. A call to
+#                       17125550123 must report the $1.410 row, not the
+#                       $0.270 one. If Asterisk's matcher preferred the
+#                       shorter pattern this is where it would show.
+#   1701                4 digits, a whole NPA. Variable-length prefixes have
+#                       to work or the deck's NPA-wide rows are ignored.
+#
+# None of these NPAs appear in dids.test.csv, and none are in BLOCKED_NPAS,
+# so a rejection here is unambiguously the blocklist doing it rather than the
+# NANP allowlist or the high-risk NPA denylist getting there first.
+# ===========================================================================
+prefix,rate_per_min,destination
+1252555,3.140000,NC-252 TEST
+1531555,2.710000,NE-531 TEST
+1712555,0.270000,IA-712 TEST SHORT
+1712555012,1.410000,IA-712 TEST LONGEST MATCH
+1701,0.180000,ND-701 TEST NPA WIDE

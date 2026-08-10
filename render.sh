@@ -87,8 +87,17 @@ MAX_CPS="${MAX_CPS:-10}"
 NANP_ONLY="${NANP_ONLY:-true}"
 BLOCK_HIGH_RISK_NPA="${BLOCK_HIGH_RISK_NPA:-true}"
 BLOCK_976="${BLOCK_976:-true}"
-VALIDATE_CALLERID="${VALIDATE_CALLERID:-true}"
+# Advisory by default: the customer's caller ID is discarded on every call, so
+# refusing the call over it throws away revenue for a field we never use. The
+# 403 path still exists and still works when this is true.
+VALIDATE_CALLERID="${VALIDATE_CALLERID:-false}"
 NORMALIZE_CALLERID="${NORMALIZE_CALLERID:-false}"
+DID_DAILY_CAP="${DID_DAILY_CAP:-200}"
+OVERFLOW_MIN="${OVERFLOW_MIN:-20}"
+DIDS_CSV="${DIDS_CSV:-dids.csv}"
+BLOCKLIST_CSV="${BLOCKLIST_CSV:-blocklist.csv}"
+[[ "$DIDS_CSV"      = /* ]] || DIDS_CSV="$HERE/$DIDS_CSV"
+[[ "$BLOCKLIST_CSV" = /* ]] || BLOCKLIST_CSV="$HERE/$BLOCKLIST_CSV"
 ENABLE_G729="${ENABLE_G729:-false}"
 DIAL_TIMEOUT="${DIAL_TIMEOUT:-60}"
 FRACTEL_QUALIFY_FREQ="${FRACTEL_QUALIFY_FREQ:-30}"
@@ -100,6 +109,11 @@ SBC_NAT_LOCAL_NET="${SBC_NAT_LOCAL_NET:-}"
 
 (( RTP_START >= 1024 && RTP_END > RTP_START && RTP_END <= 65535 )) || \
   die "RTP_START/RTP_END out of range ($RTP_START-$RTP_END)"
+
+[[ "$DID_DAILY_CAP" =~ ^[0-9]+$ ]] && (( DID_DAILY_CAP > 0 )) || \
+  die "DID_DAILY_CAP must be a positive integer, got '$DID_DAILY_CAP'"
+[[ "$OVERFLOW_MIN" =~ ^[0-9]+$ ]] || \
+  die "OVERFLOW_MIN must be an integer, got '$OVERFLOW_MIN'"
 
 # cdr_custom always writes to <astlogdir>/cdr-custom/<name> and ignores any
 # directory component in the mapping key. A CDR_CSV_PATH pointing somewhere
@@ -176,10 +190,32 @@ rewrite_contact=no
 from_domain=$FRACTEL_DOMAIN
 dtmf_mode=rfc4733
 allow_transfer=no
+; Nothing FracTEL asserts inbound is trusted: this is an outbound-only trunk.
 trust_id_inbound=no
-trust_id_outbound=no
-send_pai=no
-send_rpid=no
+; --- caller identity toward the carrier ---
+; The SBC assigns caller ID. The dialplan sets CALLERID(num) and CALLERID(ANI)
+; to the selected DID immediately before Dial(), and res_pjsip generates all
+; three identity headers from that one value:
+;
+;   From                     from CALLERID(num)
+;   P-Asserted-Identity      send_pai=yes
+;   Remote-Party-ID          send_rpid=yes
+;
+; trust_id_outbound=yes is what makes res_pjsip populate PAI and RPID with the
+; real number rather than suppressing it as restricted. Without it the headers
+; are emitted as anonymous and FracTEL attests off whatever is left, which is
+; the failure this whole change exists to prevent.
+;
+; FracTEL most likely attests off From alone, but all three are set on purpose:
+; if any single header leaked the customer's value, attestation could key to
+; the wrong number and the traceback would come back to us.
+trust_id_outbound=yes
+send_pai=yes
+send_rpid=yes
+; No Diversion header. There is no forwarding scenario on this trunk, and a
+; Diversion carrying a customer-supplied number would be a fourth place their
+; caller ID could escape.
+send_diversion=no
 inband_progress=no
 timers=yes
 timers_min_se=90
@@ -266,6 +302,234 @@ else
   SBC_BLOCKED_NPAS=","
   [[ "$BLOCK_HIGH_RISK_NPA" == "true" ]] && \
     echo "  note: BLOCK_HIGH_RISK_NPA=true but BLOCKED_NPAS is empty — nothing extra blocked" >&2
+fi
+
+# --- DID pool -------------------------------------------------------------
+# dids.csv (npa,did) becomes one dialplan global per pool:
+#
+#   SBC_DID_POOL_212=12125550101|12125550102|...
+#   SBC_DID_CNT_212=4
+#   SBC_DID_POOL_OVERFLOW=...
+#   SBC_DID_CNT_OVERFLOW=24
+#
+# The dialplan reads ${GLOBAL(SBC_DID_POOL_${SBC_NPA})}, so an NPA with no
+# pool yields an empty string and falls straight to OVERFLOW. Pools are
+# pipe-delimited rather than comma-delimited: a comma is the argument
+# separator in every dialplan application, and CUT() would need it escaped.
+#
+# Every rule below is a hard error with a line number rather than a skipped
+# row. A silently dropped DID shrinks a pool without telling anyone, and a
+# pool that shrinks far enough is the single-default-number failure this
+# build exists to prevent.
+[[ -f "$DIDS_CSV" ]] || die "DID pool not found: $DIDS_CSV
+       cp dids.csv.example dids.csv && chmod 600 dids.csv && \$EDITOR dids.csv
+       The SBC assigns caller ID from this file. It cannot place a call
+       without it."
+
+declare -A DID_POOL=() DID_MEMBER=() DID_HOME=()
+DID_TOTAL=0
+DID_CROSS=""
+_lineno=0
+
+while IFS= read -r _line || [[ -n "$_line" ]]; do
+  _lineno=$((_lineno + 1))
+  _line="${_line%$'\r'}"
+  _line="${_line#"${_line%%[![:space:]]*}"}"
+  _line="${_line%"${_line##*[![:space:]]}"}"
+  [[ -z "$_line" || "$_line" == \#* ]] && continue
+  [[ "$_line" == *,* ]] || die "$DIDS_CSV:$_lineno: expected 'npa,did', got '$_line'"
+
+  _npa="${_line%%,*}"
+  _rest="${_line#*,}"
+  _did="${_rest%%,*}"
+  _npa="$(printf '%s' "$_npa" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+  _did="$(printf '%s' "$_did" | tr -cd '0-9')"
+
+  # Optional header row.
+  [[ "$_npa" == "NPA" ]] && continue
+
+  if [[ "$_npa" != "OVERFLOW" ]]; then
+    [[ "$_npa" =~ ^[2-9][0-9]{2}$ ]] || \
+      die "$DIDS_CSV:$_lineno: '$_npa' is not a 3-digit NPA or the literal OVERFLOW"
+  fi
+
+  [[ -n "$_did" ]] || die "$DIDS_CSV:$_lineno: no digits in the did column"
+  (( ${#_did} == 10 )) && _did="1$_did"
+  (( ${#_did} == 11 )) || \
+    die "$DIDS_CSV:$_lineno: did '$_did' is ${#_did} digits, expected 10 or 11"
+  [[ "${_did:0:1}" == "1" ]] || \
+    die "$DIDS_CSV:$_lineno: 11-digit did '$_did' must start with country code 1"
+  [[ "${_did:1:1}" =~ [2-9] ]] || \
+    die "$DIDS_CSV:$_lineno: did '$_did' has an NPA starting with ${_did:1:1} (must be 2-9)"
+  [[ "${_did:4:1}" =~ [2-9] ]] || \
+    die "$DIDS_CSV:$_lineno: did '$_did' has an NXX starting with ${_did:4:1} (must be 2-9)"
+
+  if [[ -n "${DID_MEMBER[$_npa/$_did]:-}" ]]; then
+    echo "  note: $DIDS_CSV:$_lineno: $_did is already in pool $_npa — collapsed" >&2
+    continue
+  fi
+  DID_MEMBER[$_npa/$_did]=1
+
+  # A DID may legitimately serve several NPAs, but its daily cap is keyed on
+  # the number, so the pools share one budget. Say so — an operator who
+  # expected two independent 200-call allowances needs to know they have one.
+  if [[ -n "${DID_HOME[$_did]:-}" && "${DID_HOME[$_did]}" != "$_npa" ]]; then
+    DID_CROSS+="${DID_CROSS:+, }$_did (${DID_HOME[$_did]}+$_npa)"
+  else
+    DID_HOME[$_did]="$_npa"
+  fi
+
+  DID_POOL[$_npa]="${DID_POOL[$_npa]:+${DID_POOL[$_npa]}|}$_did"
+  DID_TOTAL=$((DID_TOTAL + 1))
+done < "$DIDS_CSV"
+
+(( DID_TOTAL > 0 )) || die "$DIDS_CSV contains no usable DIDs"
+
+: > "$BLOCK_DIR/did_globals"
+DID_NPA_POOLS=0
+for _k in "${!DID_POOL[@]}"; do
+  _list="${DID_POOL[$_k]}"
+  _cnt="$(awk -F'|' '{print NF}' <<< "$_list")"
+  printf 'SBC_DID_POOL_%s=%s\n' "$_k" "$_list" >> "$BLOCK_DIR/did_globals"
+  printf 'SBC_DID_CNT_%s=%s\n'  "$_k" "$_cnt"  >> "$BLOCK_DIR/did_globals"
+  [[ "$_k" != "OVERFLOW" ]] && DID_NPA_POOLS=$((DID_NPA_POOLS + 1))
+done
+
+OVERFLOW_COUNT=0
+[[ -n "${DID_POOL[OVERFLOW]:-}" ]] && \
+  OVERFLOW_COUNT="$(awk -F'|' '{print NF}' <<< "${DID_POOL[OVERFLOW]}")"
+
+# Not negotiable. A thin overflow pool degrades into "one default number",
+# which is precisely the behaviour that put 50,864 calls on a single DID.
+(( OVERFLOW_COUNT >= OVERFLOW_MIN )) || die \
+  "the OVERFLOW pool holds $OVERFLOW_COUNT number(s); OVERFLOW_MIN is $OVERFLOW_MIN.
+
+       Overflow absorbs every destination NPA you have not bought numbers in,
+       plus every call whose NPA pool is capped out for the day. Too few
+       numbers here and it collapses into the single-default-number behaviour
+       this build exists to prevent — the same failure that put 50,864 calls
+       on one DID in an afternoon.
+
+       Add OVERFLOW rows to $DIDS_CSV. Lowering OVERFLOW_MIN is not the fix."
+
+info "DID pool: $DID_TOTAL number(s) across $DID_NPA_POOLS NPA pool(s) + $OVERFLOW_COUNT overflow"
+info "per-DID daily cap: $DID_DAILY_CAP  (pool capacity ~$((DID_TOTAL * DID_DAILY_CAP)) calls/day)"
+[[ -n "$DID_CROSS" ]] && \
+  echo "  note: DID(s) in more than one pool, sharing one daily cap: $DID_CROSS" >&2
+
+# --- high-cost LRN prefix blocklist ---------------------------------------
+# blocklist.csv becomes a generated dialplan context. The match is then a
+# single lookup in Asterisk's extension matcher, which already prefers the
+# most specific pattern — so longest-prefix-wins comes for free and 1,248
+# rows cost the same per INVITE as 12. A linear scan over a comma-joined
+# string would be O(rows) on every call.
+[[ -f "$BLOCKLIST_CSV" ]] || die "blocklist not found: $BLOCKLIST_CSV
+
+       This is the primary cost control. Generate it from the rate deck:
+         python3 tools/build-blocklist.py --deck <ShortDuration.csv> --out $(basename "$BLOCKLIST_CSV")
+
+       Or start from the example:
+         cp blocklist.csv.example $(basename "$BLOCKLIST_CSV")"
+
+declare -A LRN_RATE=() LRN_DEST=()
+LRN_COUNT=0
+LRN_WORST=0
+_lineno=0
+
+while IFS= read -r _line || [[ -n "$_line" ]]; do
+  _lineno=$((_lineno + 1))
+  _line="${_line%$'\r'}"
+  _line="${_line#"${_line%%[![:space:]]*}"}"
+  _line="${_line%"${_line##*[![:space:]]}"}"
+  [[ -z "$_line" || "$_line" == \#* ]] && continue
+
+  _pfx="${_line%%,*}"
+  _rest="${_line#*,}"
+  _rate="${_rest%%,*}"
+  _dest="${_rest#*,}"
+  [[ "$_rest" == *,* ]] || _dest=""
+
+  _pfx="$(printf '%s' "$_pfx" | tr -cd '0-9')"
+  _rate="$(printf '%s' "$_rate" | tr -d '[:space:]$')"
+
+  # Header row.
+  [[ "$_line" == prefix,* ]] && continue
+  [[ -z "$_pfx" ]] && die "$BLOCKLIST_CSV:$_lineno: no digits in the prefix column"
+
+  [[ "$_rate" =~ ^[0-9]+(\.[0-9]+)?$ ]] || \
+    die "$BLOCKLIST_CSV:$_lineno: rate_per_min '$_rate' is not a decimal number"
+
+  # Reject what can never match rather than padding the dialplan with rows
+  # that read like coverage and are not. Destinations reaching this check are
+  # always 11 digits, 1 + NPA + NXX + line, NPA and NXX both starting 2-9.
+  (( ${#_pfx} >= 4 && ${#_pfx} <= 11 )) || \
+    die "$BLOCKLIST_CSV:$_lineno: prefix '$_pfx' is ${#_pfx} digits (expected 4-11, country code 1 included)"
+  [[ "${_pfx:0:1}" == "1" ]] || \
+    die "$BLOCKLIST_CSV:$_lineno: prefix '$_pfx' must start with country code 1"
+  [[ "${_pfx:1:1}" =~ [2-9] ]] || \
+    die "$BLOCKLIST_CSV:$_lineno: prefix '$_pfx' has an NPA starting with ${_pfx:1:1} (must be 2-9); it can never match"
+  if (( ${#_pfx} >= 5 )); then
+    [[ "${_pfx:4:1}" =~ [2-9] ]] || \
+      die "$BLOCKLIST_CSV:$_lineno: prefix '$_pfx' has an NXX starting with ${_pfx:4:1} (must be 2-9); it can never match"
+  fi
+
+  # A comma here would become a second Set() argument, and a quote would end
+  # the value early. Carrier free-text does not survive contact with the
+  # dialplan intact, so it gets flattened.
+  _dest="$(printf '%s' "$_dest" | tr -d '",;|' | tr -s '[:space:]' ' ')"
+  _dest="${_dest#"${_dest%%[![:space:]]*}"}"
+  _dest="${_dest%"${_dest##*[![:space:]]}"}"
+  _dest="${_dest:0:40}"
+
+  if [[ -n "${LRN_RATE[$_pfx]:-}" ]]; then
+    # Keep the worst rate. Blocking on the cheaper of two entries for the same
+    # prefix would let the expensive one through.
+    if awk -v a="$_rate" -v b="${LRN_RATE[$_pfx]}" 'BEGIN{exit !(a>b)}'; then
+      LRN_RATE[$_pfx]="$_rate"; LRN_DEST[$_pfx]="$_dest"
+    fi
+    echo "  note: $BLOCKLIST_CSV:$_lineno: duplicate prefix $_pfx — keeping the higher rate" >&2
+    continue
+  fi
+
+  LRN_RATE[$_pfx]="$_rate"
+  LRN_DEST[$_pfx]="$_dest"
+  LRN_COUNT=$((LRN_COUNT + 1))
+  awk -v a="$_rate" -v b="$LRN_WORST" 'BEGIN{exit !(a>b)}' && LRN_WORST="$_rate"
+done < "$BLOCKLIST_CSV"
+
+: > "$BLOCK_DIR/lrn_blocklist"
+if (( LRN_COUNT > 0 )); then
+  for _pfx in $(printf '%s\n' "${!LRN_RATE[@]}" | sort); do
+    # A prefix shorter than a full 11-digit number needs the trailing '.' to
+    # match the rest of it. One that IS 11 digits is already exact, and '.'
+    # would demand a 12th digit that never comes.
+    if (( ${#_pfx} >= 11 )); then _pat="_${_pfx}"; else _pat="_${_pfx}."; fi
+    cat >> "$BLOCK_DIR/lrn_blocklist" <<EOF
+exten => ${_pat},1,Set(SBC_LRN_PREFIX=${_pfx})
+ same => n,Set(SBC_LRN_RATE=${LRN_RATE[$_pfx]})
+ same => n,Set(SBC_LRN_DEST=${LRN_DEST[$_pfx]})
+ same => n,Return()
+EOF
+  done
+  _n50="$(for r in "${LRN_RATE[@]}"; do echo "$r"; done | awk '$1>=0.50' | wc -l)"
+  info "LRN blocklist: $LRN_COUNT prefix(es), $_n50 at or above \$0.50/min, worst \$$LRN_WORST/min"
+else
+  {
+    echo "; blocklist.csv held no usable rows. Nothing is blocked by rate."
+  } >> "$BLOCK_DIR/lrn_blocklist"
+  cat >&2 <<WARN
+
+  ############################################################
+  #  WARNING: $(basename "$BLOCKLIST_CSV") is empty
+  #
+  #  The high-cost prefix blocklist is the primary cost
+  #  control on this box and it is currently blocking
+  #  nothing. Regenerate it from the rate deck:
+  #
+  #    python3 tools/build-blocklist.py --deck <deck.csv>
+  ############################################################
+
+WARN
 fi
 
 # --- module noload list ---------------------------------------------------
@@ -367,6 +631,11 @@ declare -A R=(
   [NORMALIZE_CALLERID]="$NORMALIZE_CALLERID"
   [DIAL_TIMEOUT]="$DIAL_TIMEOUT"
   [FRACTEL_GW_COUNT]="$FRACTEL_GW_COUNT"
+  [DID_DAILY_CAP]="$DID_DAILY_CAP"
+  [DID_TOTAL]="$DID_TOTAL"
+  [DID_NPA_POOLS]="$DID_NPA_POOLS"
+  [OVERFLOW_COUNT]="$OVERFLOW_COUNT"
+  [LRN_COUNT]="$LRN_COUNT"
   [FRACTEL_DOMAIN]="$FRACTEL_DOMAIN"
   [CDR_CSV_PATH]="$CDR_CSV_PATH"
   [CDR_CSV_DIR]="$(dirname "$CDR_CSV_PATH")"
