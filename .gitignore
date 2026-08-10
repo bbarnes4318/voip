@@ -70,3 +70,7 @@ Thumbs.db
 # Python bytecode from tools/
 __pycache__/
 *.pyc
+
+# FracTEL order-run state: contains purchased DIDs, not secrets, but
+# it is site-specific and belongs on the box that ran the order.
+fractel-order-state.json
