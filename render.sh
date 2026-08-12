@@ -634,7 +634,14 @@ DENY_MODULES=(
 
   # Anything that can execute a command or reach an external interpreter.
   # These are the classic pivot from "dialplan bug" to "shell on the SBC".
-  app_system.so func_shell.so app_exec.so res_agi.so app_originate.so
+  #
+  # app_exec.so is NOT in this list, and must not be added back. See the
+  # ESSENTIAL_MODULES note below — the dialplan calls ExecIf, denying it fails
+  # every call, and Asterisk still boots cleanly so the init test cannot see it.
+  # It provides Exec/ExecIf/TryExec, which run a dialplan APPLICATION, not a
+  # shell command; the shell pivots are app_system, func_shell and res_agi, all
+  # of which stay denied.
+  app_system.so func_shell.so res_agi.so app_originate.so
   app_externalivr.so app_dictate.so app_nbscat.so app_mp3.so
   func_curl.so res_curl.so func_odbc.so
 
@@ -834,7 +841,32 @@ done
 #     a CDR. cdr_custom.so is on this list because losing it does not break
 #     calls at all; it silently stops billing, which is the worst failure mode
 #     available to us.
-ESSENTIAL_MODULES=(res_pjsip.so chan_pjsip.so pbx_config.so app_dial.so cdr_custom.so)
+#
+#     app_exec.so is here because it caused the FIRST outage and is the exact
+#     shape of failure this list exists for. It provides ExecIf, which
+#     [sbc-customer] and [sbc-did] call eight times — releasing the per-DID
+#     lock, defaulting SBC_NPA, and setting the caller-ID validity flag. Deny
+#     it and every call fails on an unknown application, while Asterisk boots
+#     clean and the init test passes. Nothing short of placing a real call
+#     detects it, so it is asserted here instead.
+#
+#     It runs a dialplan APPLICATION, not a shell command. The shell pivots
+#     (app_system, func_shell, res_agi, app_originate) stay denied; keeping
+#     app_exec loaded costs nothing in that threat model.
+#
+#     If you add an application or function to the dialplan, add its module
+#     here and confirm it is not in DENY_MODULES above. The two lists have to
+#     be read together and neither one checks the dialplan for you.
+ESSENTIAL_MODULES=(
+  res_pjsip.so chan_pjsip.so pbx_config.so app_dial.so cdr_custom.so
+  app_exec.so      # ExecIf     — x8 in [sbc-customer] / [sbc-did]
+  app_stack.so     # Gosub/Return — DID selection and the LRN blocklist
+  func_db.so       # DB()       — the per-DID daily cap counters
+  func_lock.so     # TRYLOCK    — the cap's read-modify-write
+  func_dialplan.so # DIALPLAN_EXISTS — the high-cost prefix blocklist
+  func_cut.so func_logic.so func_strings.so func_channel.so
+  func_callerid.so func_global.so func_groupcount.so
+)
 for m in "${ESSENTIAL_MODULES[@]}"; do
   if grep -qE "^[[:space:]]*noload[[:space:]]*=>[[:space:]]*${m//./\\.}" "$STAGE/modules.conf"; then
     die "modules.conf noloads $m, which this SBC requires.
