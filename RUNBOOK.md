@@ -574,6 +574,19 @@ sudo ./tests/run-acceptance.sh
 ./didctl.sh distribution
 ```
 
+**Counting available gateways.** Use the Status *field*, not a substring:
+
+```bash
+asterisk -rx "pjsip show contacts" | awk '$1=="Contact:" && $4=="Avail"{n++} END{print n+0}'
+```
+
+Do **not** use `pjsip show endpoints | grep -ci avail`. Case-insensitively,
+`avail` matches `Unavail` and the `Unavailable` that `pjsip show endpoints`
+reports for the IP-auth customer legs — those legs have no AOR and no qualify,
+so `Unavailable` is their normal steady state and says nothing about health.
+That one-liner reported **7** on a box with **5** gateways, and the number
+drifts as endpoint state changes rather than as gateways go up and down.
+
 ```bash
 sudo nft list table inet sbc
 ```

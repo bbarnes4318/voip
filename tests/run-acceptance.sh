@@ -210,7 +210,12 @@ for e in pkclient1 pkclient2 fractel1; do
   grep -q "$e" <<< "$EP" || MISSING+="$e "
 done
 CONTACTS="$(asterisk -rx 'pjsip show contacts' 2>/dev/null | grep 'fractel' || true)"
-AVAIL="$(grep -c 'Avail' <<< "$CONTACTS" || true)"
+# Whole-field match on the Status column, not a substring search. `grep -ci
+# avail` also matches "Unavail" and the "Unavailable" that `pjsip show
+# endpoints` reports for the IP-auth customer legs — which is how a one-liner
+# reported 7 available gateways on a box that had 5.
+#   Contact:  fractel1/sip:HOST:5060  <hash>  Avail  90.617
+AVAIL="$(awk '$1=="Contact:" && $4=="Avail" {n++} END{print n+0}' <<< "$CONTACTS")"
 if [[ -n "$MISSING" ]]; then
   fail "crit 1" "missing endpoint(s): $MISSING"
 elif [[ "${AVAIL:-0}" -lt 1 ]]; then

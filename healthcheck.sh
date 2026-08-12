@@ -51,13 +51,21 @@ else
   # --- FracTEL trunk reachability, straight from qualify ------------------
   # qualify_frequency in pjsip.conf drives an OPTIONS ping per AOR; this is
   # simply reading the result rather than generating new traffic.
-  # Status column is one of Avail / Unavail / Unknown / NonQual / Created.
-  # Matching is case-sensitive on purpose: "Unavail" is lowercase after the U,
-  # so it cannot be mistaken for "Avail".
+  # Status column is one of Avail / Unavail / Unknown / NonQual / Created, and
+  # it is matched as a whole FIELD, not as a substring.
+  #
+  # A case-sensitive `grep -c Avail` does happen to work here, because
+  # "Unavail" is lowercase after the U. That is a coincidence of formatting and
+  # a bad thing to rely on: `grep -ci avail` matches "Unavail" AND the
+  # "Unavailable" that `pjsip show endpoints` prints for the customer legs,
+  # which is how an operator one-liner reported 7 gateways available on a box
+  # that had 5. Comparing the field exactly cannot drift that way.
+  #
+  # Line shape:  Contact:  fractel1/sip:HOST:5060  <hash>  Avail  90.617
   CONTACT_LIST="$("$AST" -rx "pjsip show contacts" 2>/dev/null | grep 'fractel' || true)"
   CONTACTS="$(grep -c . <<< "${CONTACT_LIST:-}" || true)"
   [[ -z "$CONTACT_LIST" ]] && CONTACTS=0
-  AVAIL="$(grep -c 'Avail' <<< "${CONTACT_LIST:-}" || true)"
+  AVAIL="$(awk '$1=="Contact:" && $4=="Avail" {n++} END{print n+0}' <<< "${CONTACT_LIST:-}")"
 
   if (( CONTACTS == 0 )); then
     note crit "no FracTEL contacts configured — check FRACTEL_PROXY_IPS and re-run install.sh"
