@@ -295,7 +295,7 @@ note "everything except SSH-from-admin must report filtered. See tests/README.md
 M="$(mark)"
 if sipp_run happy uac-invite.xml destinations.csv "$PK1" 5061 -m 1 -d 4000; then
   GW="$(since "$M" | grep -o 'gw=fractel[0-9]*' | head -1)"
-  pass "crit 4" "authorized INVITE from pkclient1 answered end to end via ${GW:-fractel?}"
+  pass "crit 4" "authorized INVITE from ${PK_EPS[0]} answered end to end via ${GW:-fractel?}"
 else
   fail "crit 4" "authorized call did not complete — see $LOGDIR/happy.err"
   note "$(since "$M" | grep 'SBC-REJECT' | head -2)"
@@ -329,9 +329,9 @@ sipp -sf "$SIPP_DIR/uac-invite.xml" -inf "$SIPP_DIR/destinations.csv" \
 HOLD_PID=$!
 sleep 6
 
-LIVE="$(asterisk -rx 'group show channels' 2>/dev/null | awk '$3=="cust" && $2=="pkclient1"' | wc -l)"
+LIVE="$(asterisk -rx 'group show channels' 2>/dev/null | awk -v ep="${PK_EPS[0]}" '$3=="cust" && $2==ep' | wc -l)"
 if [[ "$LIVE" -ne "$CAP" ]]; then
-  fail "crit 6" "expected $CAP calls holding for pkclient1, found $LIVE — cannot test the cap"
+  fail "crit 6" "expected $CAP calls holding for ${PK_EPS[0]}, found $LIVE — cannot test the cap"
 else
   if sipp_run overcap uac-expect-503.xml destinations.csv "$PK1" 5061 -m 1; then
     R="$(count_rej "$M" CONCURRENCY_CAP)"
@@ -347,9 +347,9 @@ else
   # The cap must be per customer IP, not global — otherwise one customer IP
   # saturating the box would silently take the other one down with it.
   if sipp_run other uac-invite.xml destinations.csv "$PK2" 5062 -m 1 -d 3000; then
-    pass "crit 6b" "pkclient2 unaffected while pkclient1 is at its cap (per-IP, not global)"
+    pass "crit 6b" "${PK_EPS[1]} unaffected while ${PK_EPS[0]} is at its cap (per-IP, not global)"
   else
-    fail "crit 6b" "pkclient2 was refused while only pkclient1 was at its cap — the cap is global"
+    fail "crit 6b" "${PK_EPS[1]} was refused while only ${PK_EPS[0]} was at its cap — the cap is global"
   fi
 fi
 kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null; HOLD_PID=""
@@ -475,7 +475,7 @@ fi
 if ! command -v tcpdump >/dev/null; then
   skip "crit 10" "tcpdump not installed — cannot inspect the media path"
 else
-  DM_CUST="$(asterisk -rx 'pjsip show endpoint pkclient1' 2>/dev/null | grep -ci 'direct_media.*false' || true)"
+  DM_CUST="$(asterisk -rx "pjsip show endpoint ${PK_EPS[0]}" 2>/dev/null | grep -ci 'direct_media.*false' || true)"
   DM_GW="$(asterisk -rx 'pjsip show endpoint fractel1' 2>/dev/null | grep -ci 'direct_media.*false' || true)"
 
   timeout 20 tcpdump -i lo -n -c 400 -w "$LOGDIR/media.pcap" \
