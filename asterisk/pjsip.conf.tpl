@@ -160,7 +160,22 @@ send_pai=no
 send_rpid=no
 send_diversion=no
 inband_progress=no
-timers=yes
+; --- SESSION TIMERS ARE OFF ON THE CUSTOMER LEGS. DO NOT SET THIS BACK. ---
+; With timers=yes, the session refresh re-INVITE fires at HALF the negotiated
+; session interval. timers_min_se=90 puts that at 45 seconds. The customer's
+; dialer does not answer the refresh, so Asterisk tears the call down: every
+; single call died at exactly 45 seconds.
+;
+; The symptom reads like a network fault — uniform mid-call drops, clean SIP,
+; healthy RTP right up to the cut — and it is not one. Before turning this back
+; on, confirm their dialer actually answers a session refresh.
+;
+; timers_min_se is left in place because it only matters when timers are on,
+; and leaving it documents what the interval would be.
+;
+; The FracTEL side keeps timers=yes: the carrier answers refreshes, and on that
+; leg the timer is what reclaims a channel if the far end vanishes.
+timers=no
 timers_min_se=90
 sdp_session=SBC
 language=en
@@ -200,7 +215,22 @@ send_pai=no
 send_rpid=no
 send_diversion=no
 inband_progress=no
-timers=yes
+; --- SESSION TIMERS ARE OFF ON THE CUSTOMER LEGS. DO NOT SET THIS BACK. ---
+; With timers=yes, the session refresh re-INVITE fires at HALF the negotiated
+; session interval. timers_min_se=90 puts that at 45 seconds. The customer's
+; dialer does not answer the refresh, so Asterisk tears the call down: every
+; single call died at exactly 45 seconds.
+;
+; The symptom reads like a network fault — uniform mid-call drops, clean SIP,
+; healthy RTP right up to the cut — and it is not one. Before turning this back
+; on, confirm their dialer actually answers a session refresh.
+;
+; timers_min_se is left in place because it only matters when timers are on,
+; and leaving it documents what the interval would be.
+;
+; The FracTEL side keeps timers=yes: the carrier answers refreshes, and on that
+; leg the timer is what reclaims a channel if the far end vanishes.
+timers=no
 timers_min_se=90
 sdp_session=SBC
 language=en
