@@ -172,7 +172,8 @@ echo "==========================================================================
 command -v sipp >/dev/null || { echo "sipp not installed: apt install -y sip-tester"; exit 1; }
 asterisk -rx "core show version" >/dev/null 2>&1 || { echo "Asterisk is not running"; exit 1; }
 
-if ! asterisk -rx "pjsip show identifies" 2>/dev/null | grep -q "$PK1"; then
+_identifies="$(asterisk -rx "pjsip show identifies" 2>/dev/null)"
+if ! grep -q "$PK1" <<< "$_identifies"; then
   echo
   echo "${RED}Test configuration is not applied.${NC}"
   echo "This suite needs the trunk pointed at the local stub, not FracTEL."

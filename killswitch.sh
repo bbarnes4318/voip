@@ -198,7 +198,12 @@ case "$ACTION" in
     # is not. Exit non-zero so a monitoring wrapper notices.
     if have_asterisk; then
       LIVE_ON=0
-      "$AST" -rx "dialplan show globals" 2>/dev/null | grep -qE '^\s*SBC_KILLSWITCH\s*=\s*1' && LIVE_ON=1
+      # Captured, not piped: `grep -q` exits on match and SIGPIPEs
+      # `asterisk -rx`, and with pipefail that turns a match into a failure.
+      # Here that would report the killswitch OFF while traffic is actually
+      # being refused — the exact misread this check exists to catch.
+      _globals="$("$AST" -rx "dialplan show globals" 2>/dev/null || true)"
+      grep -qE '^\s*SBC_KILLSWITCH\s*=\s*1' <<< "$_globals" && LIVE_ON=1
       case "$S:$LIVE_ON" in
         off:0|on:1|hard:1) ;;
         *) echo; echo "  WARNING: persisted state '$S' does not match the live dialplan."

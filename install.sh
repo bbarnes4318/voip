@@ -533,7 +533,8 @@ info "fractel endpoint lines: $GWN"
 # makes ${LOCK(...)} expand to nothing and the cap silently stop counting.
 # Check for them explicitly rather than discovering it in a fraud alert.
 for fn in LOCK TRYLOCK UNLOCK DB DIALPLAN_EXISTS CUT IF STRFTIME; do
-  if asterisk -rx "core show function $fn" 2>/dev/null | grep -qi "$fn"; then
+  _fn_out="$(asterisk -rx "core show function $fn" 2>/dev/null)"
+  if grep -qi "$fn" <<< "$_fn_out"; then
     :
   else
     echo "    MISSING dialplan function $fn" >&2

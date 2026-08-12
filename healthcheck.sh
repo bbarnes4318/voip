@@ -93,7 +93,13 @@ else
   else
     while read -r ep; do
       [[ -n "$ep" ]] || continue
-      if "$AST" -rx "pjsip show endpoint $ep" 2>/dev/null | grep -q "$ep"; then
+      # Captured, not piped. `grep -q` exits on the first match, which
+      # SIGPIPEs `asterisk -rx` (status 141), and this script runs with
+      # pipefail — so a SUCCESSFUL match intermittently reported the endpoint
+      # as MISSING and the whole box as DOWN. Measured at 2 in 30 on a live
+      # box, and it pages.
+      _ep_out="$("$AST" -rx "pjsip show endpoint $ep" 2>/dev/null)"
+      if grep -q "$ep" <<< "$_ep_out"; then
         note ok "endpoint $ep configured"
       else
         note crit "endpoint $ep is MISSING — customer traffic from that IP will be refused"
@@ -102,7 +108,10 @@ else
   fi
 
   # --- killswitch ---------------------------------------------------------
-  if "$AST" -rx "dialplan show globals" 2>/dev/null | grep -qE '^\s*SBC_KILLSWITCH\s*=\s*1'; then
+  # Captured for the same reason as above: piped, a false negative here means
+  # failing to say the killswitch is on.
+  _globals="$("$AST" -rx "dialplan show globals" 2>/dev/null)"
+  if grep -qE '^\s*SBC_KILLSWITCH\s*=\s*1' <<< "$_globals"; then
     note warn "KILLSWITCH IS ON — customer traffic is being refused by design"
   fi
 fi
