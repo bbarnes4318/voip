@@ -3,10 +3,22 @@
 # render.sh — turn asterisk/*.tpl into asterisk/*.conf using config.env.
 #
 #   ./render.sh                      render into ./asterisk/
-#   ./render.sh -o /etc/asterisk     render straight into place
+#   ./render.sh -o /etc/asterisk     render, validate, back up, then promote
 #   CONF=tests/config.test.env ./render.sh -o /etc/asterisk
+#   ./render.sh -o /etc/asterisk --no-validate --no-backup   (don't)
 #
 # Idempotent: same config.env in, byte-identical output. Safe to re-run.
+#
+# Nothing is written to the output directory until the rendered config has
+# been proven to boot. The order is: render to a temp dir -> boot a throwaway
+# Asterisk against it in an isolated network namespace -> back up the files
+# about to be overwritten -> install them as asterisk:asterisk 0640 -> confirm
+# the asterisk user can actually read them.
+#
+# That ordering exists because writing straight into /etc/asterisk took this
+# box down three times: files owned root:root are unreadable by the asterisk
+# user, and Asterisk exits at startup with "modules.conf invalid or missing" —
+# hours later, unattended, with customers on it.
 #
 # Two kinds of placeholder appear in the templates:
 #
@@ -28,15 +40,29 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="${CONF:-$HERE/config.env}"
 OUTDIR="$HERE/asterisk"
 STRICT_PLACEHOLDER_CHECK=1
+VALIDATE=1
+BACKUP=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o|--out)  OUTDIR="$2"; shift 2 ;;
     -c|--conf) CONF="$2";   shift 2 ;;
+    # Escape hatches. Both default ON; you have to ask for the unsafe thing.
+    --no-validate) VALIDATE=0; shift ;;
+    --no-backup)   BACKUP=0;   shift ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "render.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
+
+# The user Asterisk runs as. Config only has to be *readable* by it, so the
+# packaged convention on this box (asterisk:asterisk 0640) is what we match.
+AST_USER="$(id -un asterisk 2>/dev/null || true)"
+AST_GROUP="$(id -gn asterisk 2>/dev/null || true)"
+CAN_CHOWN=0
+if [[ $EUID -eq 0 && -n "$AST_USER" && -n "$AST_GROUP" ]]; then
+  CAN_CHOWN=1
+fi
 
 die() { echo "render.sh: ERROR: $*" >&2; exit 1; }
 info() { echo "  $*"; }
@@ -633,7 +659,29 @@ if [[ -n "${EXTRA_DENY_MODULES:-}" ]]; then
   DENY_MODULES+=("${_extra_deny[@]}")
 fi
 
-MODDIR="${ASTERISK_MODULE_DIR:-/usr/lib/asterisk/modules}"
+# Where the modules actually live. The Debian/Ubuntu packages put them under
+# a multiarch path, not /usr/lib/asterisk/modules — so the old hard-coded
+# default missed them *on the SBC itself*, silently took the "rendered
+# off-box" branch, and stamped a note into modules.conf saying so. Ask
+# asterisk.conf first, then try the known locations.
+detect_moddir() {
+  local from_conf
+  if [[ -r /etc/asterisk/asterisk.conf ]]; then
+    from_conf="$(sed -n 's/^[[:space:]]*astmoddir[[:space:]]*=>[[:space:]]*//p' \
+                 /etc/asterisk/asterisk.conf | tail -1 | tr -d '[:space:]')"
+    [[ -n "$from_conf" && -d "$from_conf" ]] && { printf '%s' "$from_conf"; return; }
+  fi
+  local d
+  for d in "/usr/lib/$(uname -m)-linux-gnu/asterisk/modules" \
+           /usr/lib/x86_64-linux-gnu/asterisk/modules \
+           /usr/lib/asterisk/modules \
+           /usr/lib64/asterisk/modules; do
+    [[ -d "$d" ]] && { printf '%s' "$d"; return; }
+  done
+  printf '/usr/lib/asterisk/modules'   # not present: the off-box branch handles it
+}
+
+MODDIR="${ASTERISK_MODULE_DIR:-$(detect_moddir)}"
 : > "$BLOCK_DIR/noload"
 if [[ -d "$MODDIR" ]]; then
   for m in "${DENY_MODULES[@]}"; do
@@ -733,13 +781,33 @@ render_one() {
   mv "$out.tmp" "$out"
 }
 
-mkdir -p "$OUTDIR"
+# ---------------------------------------------------------------------------
+# Render into a staging directory, prove the result is usable, and only then
+# put it in place.
+#
+# Writing straight into /etc/asterisk is how this box was taken down three
+# times: a render that fails halfway, or produces files Asterisk cannot read,
+# leaves a config that will not start — and Asterisk only finds out at the
+# next restart, which is typically hours later and unattended.
+#
+# Nothing below touches $OUTDIR until every check has passed.
+# ---------------------------------------------------------------------------
+
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/render-sh-stage.XXXXXX")"
+SANDBOX=""
+cleanup() {
+  [[ -n "${STAGE:-}"   && -d "$STAGE"   ]] && rm -rf "$STAGE"
+  [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
+  return 0
+}
+trap cleanup EXIT
+
 shopt -s nullglob
 count=0
 for tpl in "$HERE"/asterisk/*.tpl; do
   base="$(basename "$tpl" .tpl)"
-  render_one "$tpl" "$OUTDIR/$base"
-  chmod 640 "$OUTDIR/$base"
+  render_one "$tpl" "$STAGE/$base"
+  chmod 640 "$STAGE/$base"
   info "rendered $base"
   count=$((count + 1))
 done
@@ -747,4 +815,191 @@ shopt -u nullglob
 
 (( count > 0 )) || die "no templates found in $HERE/asterisk/*.tpl"
 
-echo "render.sh: $count file(s) written to $OUTDIR from $(basename "$CONF")"
+# --- validation ------------------------------------------------------------
+
+# 1. Nothing empty, and the file whose absence kills Asterisk must be present.
+#    "modules.conf invalid or missing" is the exact error this box died with.
+for f in "$STAGE"/*; do
+  [[ -s "$f" ]] || die "rendered $(basename "$f") is empty — refusing to promote"
+done
+[[ -s "$STAGE/modules.conf" ]] || \
+  die "modules.conf was not rendered. Asterisk exits at startup without it.
+       Refusing to promote; $OUTDIR is untouched."
+
+# 1b. The modules this SBC cannot do its job without.
+#
+#     The boot test below answers "does Asterisk start", which is not the same
+#     question as "does it still work". Asterisk starts perfectly happily with
+#     autoload=no and no modules at all — it just cannot route a call or write
+#     a CDR. cdr_custom.so is on this list because losing it does not break
+#     calls at all; it silently stops billing, which is the worst failure mode
+#     available to us.
+ESSENTIAL_MODULES=(res_pjsip.so chan_pjsip.so pbx_config.so app_dial.so cdr_custom.so)
+for m in "${ESSENTIAL_MODULES[@]}"; do
+  if grep -qE "^[[:space:]]*noload[[:space:]]*=>[[:space:]]*${m//./\\.}" "$STAGE/modules.conf"; then
+    die "modules.conf noloads $m, which this SBC requires.
+       Refusing to promote; $OUTDIR is untouched."
+  fi
+done
+if grep -qE '^[[:space:]]*autoload[[:space:]]*=[[:space:]]*no' "$STAGE/modules.conf"; then
+  for m in "${ESSENTIAL_MODULES[@]}"; do
+    grep -qE "^[[:space:]]*(pre)?load[[:space:]]*=>[[:space:]]*${m//./\\.}" "$STAGE/modules.conf" || \
+      die "modules.conf sets autoload=no but never loads $m.
+       Asterisk would start and then be unable to do its job.
+       Refusing to promote; $OUTDIR is untouched."
+  done
+fi
+
+# 2. Boot a throwaway Asterisk against the staged config.
+#
+#    This is the check that would have caught all three outages, but it has to
+#    be done carefully: this box carries live calls, and a second Asterisk that
+#    grabs 5060, the RTP range, the control socket or astdb could cause the
+#    very outage we are preventing. So the test instance gets
+#      - its own run/log/spool/lib directories, sharing no state; and
+#      - its own network namespace, so every bind it attempts is confined
+#        there and cannot collide with or steal from the running instance.
+#
+#    If that isolation is not available, the test is SKIPPED LOUDLY rather
+#    than run unisolated. A validation step that itself causes an outage is
+#    worse than no validation step.
+asterisk_boots_against_staging() {
+  local ast; ast="$(command -v asterisk || true)"
+  if [[ -z "$ast" ]]; then
+    info "SKIP init test: no asterisk binary here (rendering off-box)"
+    return 0
+  fi
+  if ! command -v unshare >/dev/null; then
+    info "SKIP init test: 'unshare' not available, so the test instance could not"
+    info "     be network-isolated. Refusing to start a second Asterisk unisolated"
+    info "     on a box that may be carrying calls. Install util-linux to enable."
+    return 0
+  fi
+
+  SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/render-sh-boot.XXXXXX")"
+  mkdir -p "$SANDBOX"/{etc,run,log,spool,lib,lib/agi-bin,cache}
+  cp -a "$STAGE"/. "$SANDBOX/etc/"
+
+  # Every path points inside the sandbox. astmoddir is the only real one —
+  # loading the actual modules is the point of the exercise.
+  cat > "$SANDBOX/etc/asterisk.conf" <<EOF
+[directories]
+astetcdir => $SANDBOX/etc
+astmoddir => $MODDIR
+astvarlibdir => $SANDBOX/lib
+astdbdir => $SANDBOX/lib
+astkeydir => $SANDBOX/lib
+astdatadir => $SANDBOX/lib
+astagidir => $SANDBOX/lib/agi-bin
+astspooldir => $SANDBOX/spool
+astrundir => $SANDBOX/run
+astlogdir => $SANDBOX/log
+astcachedir => $SANDBOX/cache
+
+[options]
+verbose = 3
+documentation_language = en_US
+EOF
+
+  # The sandbox must be readable by the user Asterisk will drop to.
+  if [[ -n "$AST_USER" ]] && id -u "$AST_USER" >/dev/null 2>&1; then
+    chown -R "$AST_USER:$AST_GROUP" "$SANDBOX" 2>/dev/null || true
+  fi
+
+  local out rc=0
+  info "init test: booting a throwaway Asterisk in an isolated namespace"
+  # lo is down inside a fresh netns; bring it up so binds behave normally.
+  out="$(unshare --net -- sh -c "
+            ip link set lo up 2>/dev/null || true
+            exec timeout 25 '$ast' -C '$SANDBOX/etc/asterisk.conf' -cvvv -f
+         " 2>&1 <<<'core stop now' || true)"
+  rc=$?
+
+  # Asterisk is noisy; what matters is whether it reached "Asterisk Ready"
+  # and whether it complained about the config we just rendered.
+  if grep -qiE 'Asterisk Ready|PBX UUID|Asterisk Event Logger Started' <<<"$out"; then
+    local warns
+    warns="$(grep -ciE 'WARNING|ERROR' <<<"$out" || true)"
+    info "init test: PASSED (asterisk initialised; $warns warning/error line(s))"
+    if (( warns > 0 )); then
+      info "     first few:"
+      grep -iE 'WARNING|ERROR' <<<"$out" | head -5 | sed 's/^/       /'
+    fi
+    return 0
+  fi
+
+  printf '%s\n' "$out" | tail -40 >&2
+  die "the staged config did NOT initialise (see the last 40 lines above).
+       $OUTDIR has not been touched and Asterisk is still running on the
+       config it had. Fix the template or config.env and re-render."
+}
+
+if (( VALIDATE )); then
+  asterisk_boots_against_staging
+else
+  info "init test: SKIPPED because --no-validate was passed"
+fi
+
+# --- backup ----------------------------------------------------------------
+#
+# install.sh takes a backup; render.sh did not, so a standalone render left no
+# way back. Only the files this run will overwrite are captured, which is
+# enough to restore and small enough to keep.
+
+if [[ -d "$OUTDIR" ]] && (( BACKUP )); then
+  overwriting=0
+  for f in "$STAGE"/*; do
+    [[ -e "$OUTDIR/$(basename "$f")" ]] && overwriting=1
+  done
+  if (( overwriting )); then
+    BACKUP_DIR="$OUTDIR.bak-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    for f in "$STAGE"/*; do
+      b="$(basename "$f")"
+      [[ -e "$OUTDIR/$b" ]] && cp -a "$OUTDIR/$b" "$BACKUP_DIR/$b"
+    done
+    info "backup: $BACKUP_DIR ($(find "$BACKUP_DIR" -type f | wc -l) file(s))"
+    info "  restore with: cp -a $BACKUP_DIR/. $OUTDIR/ && systemctl restart asterisk"
+  fi
+fi
+
+# --- promote ---------------------------------------------------------------
+
+mkdir -p "$OUTDIR"
+for f in "$STAGE"/*; do
+  b="$(basename "$f")"
+  if (( CAN_CHOWN )); then
+    # Ownership, not just mode. Rendering as root previously produced
+    # root:root 0640 files that the asterisk user could not read, and Asterisk
+    # exited with "modules.conf invalid or missing". Mode alone never fixed
+    # that; the group had to be one asterisk is in.
+    install -o "$AST_USER" -g "$AST_GROUP" -m 640 "$f" "$OUTDIR/$b"
+  else
+    install -m 640 "$f" "$OUTDIR/$b"
+  fi
+done
+
+# --- prove the result is readable by the user Asterisk runs as -------------
+#
+# The check that speaks directly to the outage. Ownership can still be wrong
+# for reasons this script does not control (a restrictive directory mode, an
+# unexpected umask), so confirm rather than assume.
+if (( CAN_CHOWN )) && command -v runuser >/dev/null; then
+  unreadable=""
+  for f in "$STAGE"/*; do
+    b="$(basename "$f")"
+    runuser -u "$AST_USER" -- test -r "$OUTDIR/$b" 2>/dev/null || unreadable+=" $b"
+  done
+  if [[ -n "$unreadable" ]]; then
+    die "these files are NOT readable by '$AST_USER' after promotion:$unreadable
+       Asterisk would fail to start. Check the mode on $OUTDIR itself."
+  fi
+  info "verified: all $count file(s) readable by '$AST_USER'"
+fi
+
+if (( CAN_CHOWN )); then
+  echo "render.sh: $count file(s) written to $OUTDIR ($AST_USER:$AST_GROUP 0640) from $(basename "$CONF")"
+else
+  echo "render.sh: $count file(s) written to $OUTDIR (0640) from $(basename "$CONF")"
+  info "not root, so ownership was left as-is — fine for inspection, not for /etc/asterisk"
+fi
