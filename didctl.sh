@@ -465,14 +465,37 @@ sync-globals)
   WANT="$(awk '/^\[globals\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z_][A-Za-z0-9_]*=/{print}' "$CONF_FILE")"
   [[ -n "$WANT" ]] || die "no [globals] block found in $CONF_FILE"
 
+  # `asterisk -rx` will not carry an arbitrarily long command. Measured on
+  # Asterisk 20: the whole command line survives to about 491 bytes and fails
+  # somewhere before 506, and the failure mode is the worst available — the
+  # CLI returns success and the global keeps its OLD value.
+  #
+  # SBC_DID_POOL_OVERFLOW is the one that hits this. At ~12 bytes per DID the
+  # ceiling is roughly 38 overflow numbers; a 36-number pool produced a
+  # 473-byte command and fit with two numbers to spare. Past that, the pool
+  # can only be loaded by restarting Asterisk, which reads [globals] from the
+  # file directly.
+  #
+  # This is called out separately because the counter global is short and
+  # updates fine while the pool global silently does not: the dialplan then
+  # believes it has 236 numbers to choose from and can only address 36, and
+  # every selection past the 36th yields an EMPTY DID.
+  CLI_LIMIT=490
+
   HAVE="$("$AST" -rx "dialplan show globals" 2>/dev/null | sed 's/^[[:space:]]*//')"
-  changed=0; same=0
+  changed=0; same=0; toolong=""
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     name="${line%%=*}"; val="${line#*=}"
     cur="$(grep -m1 "^${name}=" <<< "$HAVE" | cut -d= -f2-)"
     if [[ "$cur" != "$val" ]]; then
-      "$AST" -rx "dialplan set global ${name} ${val}" >/dev/null 2>&1
+      cmd="dialplan set global ${name} ${val}"
+      if (( ${#cmd} > CLI_LIMIT )); then
+        toolong+="${toolong:+ }$name"
+        [[ "${2:-}" == "--verbose" ]] && echo "  SKIP  $name (${#cmd} bytes, over the CLI limit)"
+        continue
+      fi
+      "$AST" -rx "$cmd" >/dev/null 2>&1
       [[ "${2:-}" == "--verbose" ]] && echo "  set   $name"
       changed=$((changed + 1))
     else
@@ -492,6 +515,25 @@ sync-globals)
   done <<< "$WANT"
 
   echo "  updated $changed, already correct $same, mismatched $bad"
+  if [[ -n "$toolong" ]]; then
+    echo
+    echo "  ${R}TOO LONG FOR THE CLI:${N} $toolong"
+    echo
+    echo "  These cannot be applied at runtime. 'dialplan set global' silently"
+    echo "  keeps the old value once the command passes ~${CLI_LIMIT} bytes, so this is"
+    echo "  reported rather than attempted — attempting it is what produces a"
+    echo "  pool the dialplan half-believes in."
+    echo
+    echo "  Loading them needs a drain and a restart, which reads [globals]"
+    echo "  straight out of $CONF_FILE:"
+    echo
+    echo "      sudo $HERE/killswitch.sh on      # refuse new calls"
+    echo "      asterisk -rx 'core show channels'  # wait for zero"
+    echo "      sudo systemctl restart asterisk"
+    echo "      sudo $HERE/killswitch.sh off     # a restart clears the global"
+    echo
+    echo "  Until then the running dialplan is serving the OLD value."
+  fi
   if (( bad )); then
     echo "  ${R}the running dialplan does not match $CONF_FILE${N}"
     exit 1
