@@ -353,6 +353,40 @@ drain window (`killswitch.sh on`, wait for channels to reach zero, restart,
 > mechanism `killswitch.sh` uses. It reads every value back and exits non-zero
 > if the running dialplan still disagrees with the file.
 
+> **A pool global can be too long for the CLI to carry, and the failure looks
+> like success.**
+>
+> `dialplan set global` goes over the Asterisk control socket, and the whole
+> command stops fitting somewhere between 491 and 506 bytes. Past that the CLI
+> returns success and the global **keeps its old value**.
+>
+> `SBC_DID_POOL_OVERFLOW` is the one that reaches it. At ~12 bytes per DID the
+> ceiling is about **38 overflow numbers**. A 36-number pool produced a
+> 473-byte command and fit with two numbers to spare; 236 numbers is 2,831
+> bytes and cannot be applied at runtime at all.
+>
+> The dangerous part is that it half-applies. `SBC_DID_CNT_OVERFLOW` is short
+> and updates fine, so the dialplan believes it has 236 numbers to choose from
+> while it can only address 36, and **every selection past the 36th yields an
+> empty DID**. Measured on this box during the 494-DID rollout.
+>
+> `sync-globals` now measures the command first, refuses to send one that
+> cannot land, and prints the procedure below. If you see `TOO LONG FOR THE
+> CLI`, the running dialplan is still serving the old pool and the only way to
+> load the new one is a drain and restart:
+>
+> ```bash
+> sudo ./killswitch.sh on
+> asterisk -rx 'core show channels'   # wait for zero
+> sudo systemctl restart asterisk
+> sudo ./killswitch.sh off
+> ```
+>
+> The last line is not optional: a restart clears `SBC_KILLSWITCH` (the
+> dialplan does not declare it), so the persisted state and the live dialplan
+> diverge across a restart. `killswitch.sh status` detects and reports that,
+> and exits 2.
+
 One thing `sync-globals` **cannot** fix: `clearglobalvars=no` also means a
 global for a pool you **deleted** from `dids.csv` survives until a full
 restart, so the box keeps asserting numbers you may no longer own. It detects
