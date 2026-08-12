@@ -96,7 +96,7 @@ guessing any of them produces a failed test rather than a working SBC.
       the list from the `hoppwhistle` box, it is a different subaccount
 - [ ] Confirmation from FracTEL that the SBC's public IP is authorized on the
       trunk, and that the trunk is **STATIC** (no registration)
-- [ ] The customer's two signaling IPs
+- [ ] The customer's signaling IPs — all of them (`PK_CLIENT_IPS`)
 - [ ] Whether the customer sources RTP from those same IPs or from a different
       block (if different: `PK_CLIENT_MEDIA_EXTRA`, or their audio dies at the
       firewall)
@@ -358,6 +358,84 @@ global for a pool you **deleted** from `dids.csv` survives until a full
 restart, so the box keeps asserting numbers you may no longer own. It detects
 this and exits 2 with the orphaned NPAs listed — clearing them needs a drain
 and restart.
+
+### Add a customer signaling IP
+
+The customer brings up a new switch and it has to reach this box. Everything
+downstream is generated from one line in `config.env`, but it lands in three
+separate systems — Asterisk, nftables and the billing portal — and **all three
+are required**. An address that clears the firewall and Asterisk but is unknown
+to the portal produces calls that are carried, completed, and billed to nobody.
+
+**1. The list.** In `config.env`, append to `PK_CLIENT_IPS`:
+
+```bash
+PK_CLIENT_IPS=<ip1>,<ip2>,<ip3>
+```
+
+Append. Never reorder, never delete from the middle. Entry 1 is `pkclient1`,
+entry 2 is `pkclient2`, and that name is the CDR's `customer_endpoint` column,
+the concurrency group and the transfer-state key. Reordering the list silently
+re-attributes history to the wrong address; `render.sh` warns when a render
+would move an existing `pkclientN`, and that warning is not advisory.
+
+**2. Asterisk.** Render, push the globals, then reload PJSIP — on a box
+carrying traffic, in this order:
+
+```bash
+sudo ./render.sh -o /etc/asterisk && sudo chown asterisk:asterisk /etc/asterisk/*.conf && sudo ./didctl.sh sync-globals && sudo asterisk -rx "pjsip reload"
+```
+
+`render.sh` installs as `asterisk:asterisk 0640` itself when run as root and
+verifies the asterisk user can read every file — the explicit `chown` is belt
+and braces for the case where something else wrote into `/etc/asterisk` since
+the last render. Root-owned config there is what took this box down for nine
+hours.
+
+`pjsip reload` is the step the DID-pool procedure above does not need. A new
+endpoint and identify only enter the running config on a PJSIP reload; without
+it `render.sh` reports success, the file on disk is correct, and the new
+address still gets no response. Transports set `allow_reload=no`, so the
+listening sockets are untouched and calls in progress do not notice.
+
+**3. The firewall.** nftables holds its own copy of the customer set:
+
+```bash
+sudo ./firewall.sh apply
+```
+
+Then, from a **second** SSH session, confirm within 90 seconds or the ruleset
+auto-reverts:
+
+```bash
+sudo ./firewall.sh confirm
+```
+
+**4. The portal.** Add the address as an identifier on the customer, or their
+calls arrive with a `source_ip` the billing side has never seen and attribute
+to nobody:
+
+```sql
+INSERT INTO portal.customer_identifiers (customer_id, kind, value, note)
+VALUES (<customer id>, 'source_ip', '<ip>', '<why, and the date>');
+```
+
+There is a matching `kind='customer_endpoint'` row per endpoint name. Add both:
+CDR attribution can key on either, and one without the other means attribution
+depends on which column the query happened to use.
+
+**5. Prove it.** All four in one pass:
+
+```bash
+sudo ./healthcheck.sh                      # endpoint pkclientN configured
+asterisk -rx "pjsip show identifies"       # the new IP maps to the new endpoint
+sudo nft list set inet sbc pk_clients      # the new IP is in the set
+./didctl.sh distribution                   # after real traffic: CDRs from the new IP
+```
+
+Then wait for a real call from the new address and confirm it lands in the CDR
+with the right `source_ip` and `customer_endpoint`, and that the portal
+resolves it to the right customer.
 
 ### The DID pool
 

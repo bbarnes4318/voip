@@ -26,9 +26,9 @@ Asterisk 20 LTS with `res_pjsip`, installed on the host. No Kamailio, no
 rtpengine, no Docker, no web UI.
 
 ```
-PK_CLIENT_IP_1 ──┐
+PK_CLIENT_IPS ──┐  (one endpoint per entry: pkclient1..N)
                  ├──► [ SBC — ONE public IP ] ──► FracTEL (6 outbound proxies)
-PK_CLIENT_IP_2 ──┘      Asterisk 20 LTS / res_pjsip
+                 ┘      Asterisk 20 LTS / res_pjsip
                         B2BUA, IP auth both sides
                         full media relay
 ```
@@ -98,8 +98,8 @@ reject the call, so even a refused call produces a complete row.
 
 These are the original eleven. The addendum adds 12–17.
 
-**1. Endpoints and reachability.** `pjsip show endpoints` lists `pkclient1`,
-`pkclient2` and the FracTEL gateways; `pjsip show contacts` reports the
+**1. Endpoints and reachability.** `pjsip show endpoints` lists one
+`pkclientN` per entry in `PK_CLIENT_IPS` and the FracTEL gateways; `pjsip show contacts` reports the
 gateways `Avail`.
 
 **2. Clean load.** A restart produces zero errors, zero warnings and zero

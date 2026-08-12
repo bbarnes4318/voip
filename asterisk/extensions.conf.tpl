@@ -6,9 +6,9 @@
 ; The customer context has exactly ONE egress: Dial(PJSIP/<n>@fractelN).
 ; There are no context includes, no Local/ channels, no AGI, no System(), no
 ; Originate(). res_agi, app_system, func_shell and app_originate are not even
-; loaded (see modules.conf). If traffic from @@PK_CLIENT_IP_1@@ or
-; @@PK_CLIENT_IP_2@@ can reach anything other than the FracTEL trunk, that is
-; a bug and it is the expensive kind.
+; loaded (see modules.conf). If traffic from any customer address
+; (@@PK_CLIENT_IP_CSV@@) can reach anything other than the FracTEL trunk, that
+; is a bug and it is the expensive kind.
 ;
 ; Order of checks, cheapest and most consequential first:
 ;

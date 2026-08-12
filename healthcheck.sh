@@ -30,6 +30,16 @@ if [[ -f "$CONF" ]]; then
 fi
 CDR_CSV_PATH="${CDR_CSV_PATH:-/var/log/asterisk/cdr-custom/sbc.csv}"
 
+# Which endpoints SHOULD exist, from config.env rather than from a hardcoded
+# pair. A health check that only knows about the first two endpoints reports a
+# healthy box while the third customer IP is being refused.
+# shellcheck source=lib/pk-clients.sh
+PK_EP_NAMES=""
+if [[ -r "$HERE/lib/pk-clients.sh" ]]; then
+  . "$HERE/lib/pk-clients.sh"
+  PK_EP_NAMES="$(pk_client_endpoint_names || true)"
+fi
+
 STATUS=0
 MSGS=()
 
@@ -78,13 +88,18 @@ else
   fi
 
   # --- customer endpoints present? ---------------------------------------
-  for ep in pkclient1 pkclient2; do
-    if "$AST" -rx "pjsip show endpoint $ep" 2>/dev/null | grep -q "$ep"; then
-      note ok "endpoint $ep configured"
-    else
-      note crit "endpoint $ep is MISSING — customer traffic from that IP will be refused"
-    fi
-  done
+  if [[ -z "$PK_EP_NAMES" ]]; then
+    note warn "cannot tell which customer endpoints to expect (no readable config.env or lib/pk-clients.sh)"
+  else
+    while read -r ep; do
+      [[ -n "$ep" ]] || continue
+      if "$AST" -rx "pjsip show endpoint $ep" 2>/dev/null | grep -q "$ep"; then
+        note ok "endpoint $ep configured"
+      else
+        note crit "endpoint $ep is MISSING — customer traffic from that IP will be refused"
+      fi
+    done <<< "$PK_EP_NAMES"
+  fi
 
   # --- killswitch ---------------------------------------------------------
   if "$AST" -rx "dialplan show globals" 2>/dev/null | grep -qE '^\s*SBC_KILLSWITCH\s*=\s*1'; then

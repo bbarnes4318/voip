@@ -4,13 +4,13 @@
 ;
 ; Topology:
 ;
-;   pkclient1 (@@PK_CLIENT_IP_1@@) ─┐
-;                                    ├─► [ this SBC, @@SBC_PUBLIC_IP@@ ] ─► fractel1..N
-;   pkclient2 (@@PK_CLIENT_IP_2@@) ─┘
+;   @@PK_CLIENT_EP_CSV@@
+;   (@@PK_CLIENT_IP_CSV@@)
+;        └─► [ this SBC, @@SBC_PUBLIC_IP@@ ] ─► fractel1..N
 ;
 ; The SBC is a back-to-back user agent. The customer leg is terminated here
 ; and a brand new leg is originated toward FracTEL from this box's own single
-; public IP. That is what lets two customer IPs converge into the one source
+; public IP. That is what lets every customer IP converge into the one source
 ; address FracTEL authorises on the trunk.
 ;
 ; The whole design collapses if media does not transit this box: FracTEL would
@@ -32,8 +32,8 @@ user_agent=SBC
 
 ; IP is the ONLY way an endpoint may be identified. Without this, res_pjsip
 ; would also accept username-based identification, which means a caller could
-; claim to be pkclient1 just by putting that in the From header. Both customer
-; endpoints additionally set identify_by=ip.
+; claim to be pkclient1 just by putting that in the From header. Every customer
+; endpoint additionally sets identify_by=ip.
 endpoint_identifier_order=ip
 
 ; Track and log unidentified sources. These land in the security log and are
@@ -117,128 +117,42 @@ type=acl
 
 
 ; ---------------------------------------------------------------------------
-; Customer endpoints
+; Customer endpoints — generated, one set per entry in PK_CLIENT_IPS
 ;
-; Two endpoints, not one endpoint with two match lines. That buys:
+; @@PK_CLIENT_COUNT@@ endpoint(s): @@PK_CLIENT_EP_CSV@@
+;
+; One endpoint per address, not one endpoint with several match lines. That
+; buys:
 ;   - per-IP CDR attribution (customer_endpoint column)
 ;   - per-IP concurrency caps (GROUP() keyed on endpoint name)
-;   - the ability to disable one IP without touching the other
+;   - the ability to disable one IP without touching the others
+;
+; The names are POSITIONAL: entry 1 of PK_CLIENT_IPS is pkclient1, entry 2 is
+; pkclient2, and so on. That name is the billing key, so the list is appended
+; to and never reordered. See lib/pk-clients.sh.
 ;
 ; No [auth] section and no auth= line anywhere: authentication is by source IP
-; only. There is nothing here to brute-force and no registration to expire.
-; Neither endpoint has an aors= line, so this box has no way to originate a
-; call toward the customer even if the dialplan were wrong.
+; only. There is nothing here to brute-force and no registration to expire. No
+; endpoint has an aors= line, so this box has no way to originate a call
+; toward the customer even if the dialplan were wrong.
+;
+; --- SESSION TIMERS ARE OFF ON THE CUSTOMER LEGS. DO NOT SET THIS BACK. ---
+; With timers=yes, the session refresh re-INVITE fires at HALF the negotiated
+; session interval. timers_min_se=90 puts that at 45 seconds. The customer's
+; dialer does not answer the refresh, so Asterisk tears the call down: every
+; single call died at exactly 45 seconds.
+;
+; The symptom reads like a network fault — uniform mid-call drops, clean SIP,
+; healthy RTP right up to the cut — and it is not one. Before turning this back
+; on, confirm their dialer actually answers a session refresh.
+;
+; timers_min_se is left in place because it only matters when timers are on,
+; and leaving it documents what the interval would be.
+;
+; The FracTEL side keeps timers=yes: the carrier answers refreshes, and on that
+; leg the timer is what reclaims a channel if the far end vanishes.
 ; ---------------------------------------------------------------------------
-[pkclient1]
-type=endpoint
-context=sbc-customer
-transport=transport-udp
-identify_by=ip
-disallow=all
-@@INCLUDE:codecs@@
-
-; --- media: full relay, non-negotiable ---
-direct_media=no
-direct_media_method=invite
-disable_direct_media_on_nat=yes
-rtp_symmetric=yes
-force_rport=yes
-rewrite_contact=yes
-media_encryption=no
-rtp_timeout=120
-rtp_timeout_hold=120
-tos_audio=ef
-cos_audio=5
-
-; --- behaviour ---
-dtmf_mode=rfc4733
-allow_transfer=no
-allow_subscribe=no
-trust_id_inbound=no
-trust_id_outbound=no
-send_pai=no
-send_rpid=no
-send_diversion=no
-inband_progress=no
-; --- SESSION TIMERS ARE OFF ON THE CUSTOMER LEGS. DO NOT SET THIS BACK. ---
-; With timers=yes, the session refresh re-INVITE fires at HALF the negotiated
-; session interval. timers_min_se=90 puts that at 45 seconds. The customer's
-; dialer does not answer the refresh, so Asterisk tears the call down: every
-; single call died at exactly 45 seconds.
-;
-; The symptom reads like a network fault — uniform mid-call drops, clean SIP,
-; healthy RTP right up to the cut — and it is not one. Before turning this back
-; on, confirm their dialer actually answers a session refresh.
-;
-; timers_min_se is left in place because it only matters when timers are on,
-; and leaving it documents what the interval would be.
-;
-; The FracTEL side keeps timers=yes: the carrier answers refreshes, and on that
-; leg the timer is what reclaims a channel if the far end vanishes.
-timers=no
-timers_min_se=90
-sdp_session=SBC
-language=en
-
-[pkclient1]
-type=identify
-endpoint=pkclient1
-match=@@PK_CLIENT_IP_1@@
-
-
-[pkclient2]
-type=endpoint
-context=sbc-customer
-transport=transport-udp
-identify_by=ip
-disallow=all
-@@INCLUDE:codecs@@
-
-direct_media=no
-direct_media_method=invite
-disable_direct_media_on_nat=yes
-rtp_symmetric=yes
-force_rport=yes
-rewrite_contact=yes
-media_encryption=no
-rtp_timeout=120
-rtp_timeout_hold=120
-tos_audio=ef
-cos_audio=5
-
-dtmf_mode=rfc4733
-allow_transfer=no
-allow_subscribe=no
-trust_id_inbound=no
-trust_id_outbound=no
-send_pai=no
-send_rpid=no
-send_diversion=no
-inband_progress=no
-; --- SESSION TIMERS ARE OFF ON THE CUSTOMER LEGS. DO NOT SET THIS BACK. ---
-; With timers=yes, the session refresh re-INVITE fires at HALF the negotiated
-; session interval. timers_min_se=90 puts that at 45 seconds. The customer's
-; dialer does not answer the refresh, so Asterisk tears the call down: every
-; single call died at exactly 45 seconds.
-;
-; The symptom reads like a network fault — uniform mid-call drops, clean SIP,
-; healthy RTP right up to the cut — and it is not one. Before turning this back
-; on, confirm their dialer actually answers a session refresh.
-;
-; timers_min_se is left in place because it only matters when timers are on,
-; and leaving it documents what the interval would be.
-;
-; The FracTEL side keeps timers=yes: the carrier answers refreshes, and on that
-; leg the timer is what reclaims a channel if the far end vanishes.
-timers=no
-timers_min_se=90
-sdp_session=SBC
-language=en
-
-[pkclient2]
-type=identify
-endpoint=pkclient2
-match=@@PK_CLIENT_IP_2@@
+@@INCLUDE:customer_endpoints@@
 
 
 ; ---------------------------------------------------------------------------

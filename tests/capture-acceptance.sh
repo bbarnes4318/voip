@@ -15,7 +15,7 @@
 #
 # What gets replaced:
 #   SBC_PUBLIC_IP        -> <SBC_IP>
-#   PK_CLIENT_IP_1/2     -> <PK_IP_1> / <PK_IP_2>
+#   PK_CLIENT_IPS        -> <PK_IP_1..N>, one token per customer address
 #   FRACTEL_PROXY_IPS    -> <FRACTEL_IP_1..N>
 #   ADMIN_SSH_IP         -> <ADMIN_IP>
 #   any other non-loopback IPv4 -> <IP>
@@ -44,8 +44,20 @@ if [[ -f "$PROD_CONF" ]]; then
   esc() { printf '%s' "$1" | sed 's/\./\\./g'; }
 
   [[ -n "${SBC_PUBLIC_IP:-}"  ]] && SED_ARGS+=(-e "s/$(esc "$SBC_PUBLIC_IP")/<SBC_IP>/g")
-  [[ -n "${PK_CLIENT_IP_1:-}" ]] && SED_ARGS+=(-e "s/$(esc "$PK_CLIENT_IP_1")/<PK_IP_1>/g")
-  [[ -n "${PK_CLIENT_IP_2:-}" ]] && SED_ARGS+=(-e "s/$(esc "$PK_CLIENT_IP_2")/<PK_IP_2>/g")
+
+  # Every customer address, not the first two. A third IP that is not on this
+  # list is not redacted by name — the generic public-IPv4 rule further down
+  # would still catch it, but only if it fires, and "probably caught by the
+  # catch-all" is not a redaction guarantee for a customer's infrastructure.
+  n=0
+  # shellcheck source=../lib/pk-clients.sh
+  if [[ -r "$ROOT/lib/pk-clients.sh" ]]; then
+    . "$ROOT/lib/pk-clients.sh"
+    while read -r pk; do
+      [[ -n "$pk" ]] || continue
+      n=$((n+1)); SED_ARGS+=(-e "s/$(esc "$pk")/<PK_IP_$n>/g")
+    done <<< "$(pk_client_ips || true)"
+  fi
 
   n=0
   IFS=',' read -r -a _fp <<< "${FRACTEL_PROXY_IPS:-}"
@@ -113,8 +125,13 @@ emit "Criterion 1 — gateway contacts (qualify status)" \
      asterisk -rx "pjsip show contacts"
 emit "Criterion 1 — IP identification (which source maps to which endpoint)" \
      asterisk -rx "pjsip show identifies"
-emit "Criterion 10 — direct_media is off on the customer leg" \
-     bash -c "asterisk -rx 'pjsip show endpoint pkclient1' | grep -iE 'direct_media|rtp_symmetric|force_rport'"
+# Every customer endpoint, not just the first: the evidence has to cover the
+# address that was added last, which is the one nobody has looked at.
+emit "Criterion 10 — direct_media is off on every customer leg" \
+     bash -c "for e in \$(asterisk -rx 'pjsip show endpoints' | grep -oE 'pkclient[0-9]+' | sort -u); do
+                echo \"-- \$e\"
+                asterisk -rx \"pjsip show endpoint \$e\" | grep -iE 'direct_media|rtp_symmetric|force_rport'
+              done"
 emit "Criterion 10 — direct_media is off on the carrier leg" \
      bash -c "asterisk -rx 'pjsip show endpoint fractel1' | grep -iE 'direct_media|rtp_symmetric|force_rport'"
 emit "Criterion 12 — the carrier leg asserts our DID, not the customer's" \

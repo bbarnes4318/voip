@@ -8,17 +8,18 @@ Asterisk 20 LTS with `res_pjsip`, installed on the host. No Kamailio, no
 rtpengine, no Docker, no web UI.
 
 ```
-PK_CLIENT_IP_1 ──┐
-                 ├──► [ SBC — ONE public IP ] ──► FracTEL (6 outbound proxies)
-PK_CLIENT_IP_2 ──┘      Asterisk 20 LTS / res_pjsip
-                        B2BUA, IP auth both sides
-                        full media relay
+PK_CLIENT_IPS ──┐   (comma-separated; one endpoint per entry,
+  pkclient1     │    named pkclient1..N in list order)
+  pkclient2     ├──► [ SBC — ONE public IP ] ──► FracTEL (6 outbound proxies)
+  pkclient3 ... ┘      Asterisk 20 LTS / res_pjsip
+                       B2BUA, IP auth both sides
+                       full media relay
 ```
 
 ## The constraint this exists to solve
 
 FracTEL authorizes exactly **one** source IP per trunk. The customer has
-**two** IPs.
+**several** IPs — three at the time of writing, and the list is meant to grow.
 
 That is not a conflict, and it must not be solved with NAT tricks or a second
 trunk. The SBC is a back-to-back user agent: it terminates the customer's call
@@ -45,7 +46,7 @@ permitted. No single point of failure.
 
 | | Control | Where | Fails closed because |
 |---|---|---|---|
-| 1 | Host firewall | `firewall.sh` → nftables | `policy drop` on input; four addresses have rules, nothing else does |
+| 1 | Host firewall | `firewall.sh` → nftables | `policy drop` on input; only the customer and FracTEL addresses have rules, nothing else does |
 | 2 | SIP ACL | `[sbc-acl]` + `type=identify` in `pjsip.conf` | `deny=0.0.0.0/0.0.0.0` first, explicit permits after; `endpoint_identifier_order=ip` and `identify_by=ip` mean a source cannot claim an identity in a header |
 | 3 | Dialplan | `[sbc-customer]` in `extensions.conf` | one `Dial()` target, no includes, no `Local/`, and `res_agi`/`app_system`/`func_shell`/`app_originate` are not loaded |
 

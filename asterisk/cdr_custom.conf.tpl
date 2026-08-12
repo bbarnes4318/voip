@@ -12,7 +12,7 @@
 ;    2  timestamp_answer        far end answered, empty if never answered
 ;    3  timestamp_end           call torn down
 ;    4  source_ip               customer's signaling IP  [MANDATORY]
-;    5  customer_endpoint       pkclient1 | pkclient2
+;    5  customer_endpoint       @@PK_CLIENT_EP_CSV@@  (one per customer IP)
 ;    6  caller_id               as sent by the customer, unmodified
 ;    7  destination             normalised 11-digit NANP number dialled
 ;    8  duration                seconds from start to end

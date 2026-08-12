@@ -24,7 +24,7 @@
 #               FracTEL trunk is untouched. Takes effect in well under a
 #               second and needs no reload.
 #
-#   on --hard   the above, plus the two customer addresses are added to the
+#   on --hard   the above, plus every customer address is added to the
 #               nftables set 'pk_blocked', which sits above the conntrack rule
 #               and therefore kills established flows too. This is the "they
 #               are actively defrauding me, pull the cable" option. It WILL
@@ -48,6 +48,10 @@ AST="${AST:-asterisk}"
 
 die()  { echo "killswitch.sh: ERROR: $*" >&2; exit 1; }
 
+# shellcheck source=lib/pk-clients.sh
+[[ -r "$HERE/lib/pk-clients.sh" ]] || die "missing $HERE/lib/pk-clients.sh"
+. "$HERE/lib/pk-clients.sh"
+
 ACTION="${1:-status}"; shift || true
 HARD=0
 for a in "$@"; do
@@ -67,32 +71,31 @@ write_state() {
   chmod 0644 "$STATE_FILE"
 }
 
+# One address per line, from PK_CLIENT_IPS. Same parser as render.sh and
+# firewall.sh: a hard cut that misses an address the SBC accepts is not a cut.
 customer_ips() {
   [[ -f "$CONF" ]] || die "config file not found: $CONF"
   # shellcheck disable=SC1090
-  ( set -a; source "$CONF"; set +a; echo "${PK_CLIENT_IP_1:-},${PK_CLIENT_IP_2:-}" )
+  ( set -a; source "$CONF"; set +a; pk_client_ips )
+}
+
+nft_elements() {
+  local i el=""
+  while read -r i; do
+    [[ -n "$i" ]] || continue
+    el+="${el:+, }$i/32"
+  done <<< "$(customer_ips)"
+  printf '%s' "$el"
 }
 
 nft_block() {
-  local ips el=""
-  ips="$(customer_ips)"
-  IFS=',' read -r -a arr <<< "$ips"
-  for i in "${arr[@]}"; do
-    i="$(echo "$i" | tr -d '[:space:]')"; [[ -n "$i" ]] || continue
-    el+="${el:+, }$i/32"
-  done
+  local el; el="$(nft_elements)"
   [[ -n "$el" ]] || die "no customer IPs found in $CONF"
   nft add element inet sbc pk_blocked "{ $el }"
 }
 
 nft_unblock() {
-  local ips el=""
-  ips="$(customer_ips)"
-  IFS=',' read -r -a arr <<< "$ips"
-  for i in "${arr[@]}"; do
-    i="$(echo "$i" | tr -d '[:space:]')"; [[ -n "$i" ]] || continue
-    el+="${el:+, }$i/32"
-  done
+  local el; el="$(nft_elements)"
   [[ -n "$el" ]] || return 0
   nft delete element inet sbc pk_blocked "{ $el }" 2>/dev/null || true
 }

@@ -64,6 +64,11 @@ fi
 # shellcheck disable=SC1090
 set -a; source "$CONF"; set +a
 
+# shellcheck source=lib/pk-clients.sh
+[[ -r "$HERE/lib/pk-clients.sh" ]] || die "missing $HERE/lib/pk-clients.sh"
+. "$HERE/lib/pk-clients.sh"
+PK_EP_NAMES="$(pk_client_endpoint_names)" || die "PK_CLIENT_IPS is unusable (see above). Fix it in $CONF."
+
 # dids.csv holds numbers we own and blocklist.csv holds carrier pricing.
 # Neither is a credential, but neither belongs to every user on the box.
 for _f in "${DIDS_CSV:-dids.csv}" "${BLOCKLIST_CSV:-blocklist.csv}"; do
@@ -513,10 +518,11 @@ fi
 
 # Acceptance criterion 1: endpoints exist.
 EP_OUT="$(asterisk -rx "pjsip show endpoints" 2>/dev/null)"
-for ep in pkclient1 pkclient2; do
+while read -r ep; do
+  [[ -n "$ep" ]] || continue
   if grep -q "$ep" <<< "$EP_OUT"; then info "endpoint $ep present"
   else echo "    MISSING endpoint $ep" >&2; FAILED=1; fi
-done
+done <<< "$PK_EP_NAMES"
 GWN="$(grep -c 'fractel' <<< "$EP_OUT" || true)"
 info "fractel endpoint lines: $GWN"
 

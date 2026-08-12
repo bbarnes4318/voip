@@ -67,6 +67,12 @@ fi
 die() { echo "render.sh: ERROR: $*" >&2; exit 1; }
 info() { echo "  $*"; }
 
+# The customer IP list, parsed the same way here as in firewall.sh and
+# killswitch.sh. See lib/pk-clients.sh for why order is an identity.
+# shellcheck source=lib/pk-clients.sh
+[[ -r "$HERE/lib/pk-clients.sh" ]] || die "missing $HERE/lib/pk-clients.sh"
+. "$HERE/lib/pk-clients.sh"
+
 [[ -f "$CONF" ]] || die "config file not found: $CONF
        Copy config.env.example to config.env and fill it in."
 
@@ -78,31 +84,39 @@ set -a; source "$CONF"; set +a
 # SBC. Placeholder values from config.env.example are treated as unset.
 # ---------------------------------------------------------------------------
 
-PLACEHOLDERS='^(203\.0\.113\.(10|200)|198\.51\.100\.(21|22)|192\.0\.2\.3[1-6](,.*)?|<FILL_ME>)$'
+PLACEHOLDERS='^(203\.0\.113\.(10|200)|198\.51\.100\.2[0-9]|192\.0\.2\.3[1-6](,.*)?|<FILL_ME>)$'
 
-require() {
-  local name="$1" val="${!1:-}"
-  [[ -n "$val" ]] || die "$name is empty in $CONF"
-  if [[ "${ALLOW_PLACEHOLDERS:-0}" != "1" && "$val" =~ $PLACEHOLDERS ]]; then
-    die "$name is still the example placeholder value ('$val').
+reject_placeholder() { # reject_placeholder <label> <value>
+  if [[ "${ALLOW_PLACEHOLDERS:-0}" != "1" && "$2" =~ $PLACEHOLDERS ]]; then
+    die "$1 is still the example placeholder value ('$2').
        Put the real value in $CONF.
        (Set ALLOW_PLACEHOLDERS=1 to render anyway for inspection only.)"
   fi
 }
 
-for v in SBC_PUBLIC_IP ADMIN_SSH_IP PK_CLIENT_IP_1 PK_CLIENT_IP_2 FRACTEL_PROXY_IPS; do
+require() {
+  local name="$1" val="${!1:-}"
+  [[ -n "$val" ]] || die "$name is empty in $CONF"
+  reject_placeholder "$name" "$val"
+}
+
+for v in SBC_PUBLIC_IP ADMIN_SSH_IP FRACTEL_PROXY_IPS; do
   require "$v"
 done
 
 is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-for v in SBC_PUBLIC_IP PK_CLIENT_IP_1 PK_CLIENT_IP_2; do
-  is_ipv4 "${!v}" || die "$v='${!v}' is not a bare IPv4 address"
-done
+is_ipv4 "$SBC_PUBLIC_IP" || die "SBC_PUBLIC_IP='$SBC_PUBLIC_IP' is not a bare IPv4 address"
 
-[[ "$PK_CLIENT_IP_1" != "$PK_CLIENT_IP_2" ]] || \
-  die "PK_CLIENT_IP_1 and PK_CLIENT_IP_2 are the same address.
-       Two separate endpoints require two distinct IPs. If the customer
-       really has one IP, delete pkclient2 rather than duplicating it."
+# --- customer endpoints: one per entry in PK_CLIENT_IPS --------------------
+# Adding a customer IP is a one-line edit to config.env. It used to be a new
+# hand-written pair of PJSIP sections plus a matching edit in six other
+# scripts, and anything missed was a hole rather than an error.
+PK_LIST_RAW="$(pk_client_ips)" || die "PK_CLIENT_IPS is unusable (see above). Fix it in $CONF."
+mapfile -t PK_CLIENT_LIST <<< "$PK_LIST_RAW"
+for ip in "${PK_CLIENT_LIST[@]}"; do
+  reject_placeholder "customer IP" "$ip"
+done
+PK_CLIENT_IP_CSV="$(IFS=,; echo "${PK_CLIENT_LIST[*]}")"
 
 # Defaults for anything the operator left out.
 SIP_PORT="${SIP_PORT:-5060}"
@@ -322,13 +336,111 @@ done
 (( FRACTEL_GW_COUNT > 0 )) || die "FRACTEL_PROXY_IPS produced no usable gateways"
 info "FracTEL gateways: $FRACTEL_GW_COUNT ($FRACTEL_IP_LIST)"
 
+# --- customer endpoints: one endpoint/identify per PK_CLIENT_IPS entry -----
+#
+# One endpoint per address rather than one endpoint with several match lines.
+# That is what buys per-IP CDR attribution (the customer_endpoint column),
+# per-IP concurrency caps (GROUP() is keyed on the endpoint name), and the
+# ability to disable one address without touching the others.
+#
+# No [auth] section and no auth= line anywhere: authentication is by source IP
+# only. Nothing here to brute-force, no registration to expire. No aors= line
+# either, so this box has no way to originate a call toward the customer even
+# if the dialplan were wrong.
+: > "$BLOCK_DIR/customer_endpoints"
+PK_CLIENT_EP_CSV=""
+for _i in "${!PK_CLIENT_LIST[@]}"; do
+  _ep="pkclient$((_i + 1))"
+  _ip="${PK_CLIENT_LIST[$_i]}"
+  PK_CLIENT_EP_CSV+="${PK_CLIENT_EP_CSV:+,}$_ep"
+
+  cat >> "$BLOCK_DIR/customer_endpoints" <<EOF
+; --- customer signaling IP $((_i + 1)) of ${#PK_CLIENT_LIST[@]} ---------------------------------------
+[$_ep]
+type=endpoint
+context=sbc-customer
+transport=transport-udp
+identify_by=ip
+disallow=all
+@@INCLUDE_INLINE_CODECS@@
+
+; --- media: full relay, non-negotiable ---
+direct_media=no
+direct_media_method=invite
+disable_direct_media_on_nat=yes
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+media_encryption=no
+rtp_timeout=120
+rtp_timeout_hold=120
+tos_audio=ef
+cos_audio=5
+
+; --- behaviour ---
+dtmf_mode=rfc4733
+allow_transfer=no
+allow_subscribe=no
+trust_id_inbound=no
+trust_id_outbound=no
+send_pai=no
+send_rpid=no
+send_diversion=no
+inband_progress=no
+; SESSION TIMERS ARE OFF ON THE CUSTOMER LEGS. DO NOT SET THIS BACK. The full
+; reason is in the comment above this generated block: with timers=yes every
+; single call on this box died at exactly 45 seconds.
+timers=no
+timers_min_se=90
+sdp_session=SBC
+language=en
+
+[$_ep]
+type=identify
+endpoint=$_ep
+match=$_ip
+
+EOF
+done
+
+# Endpoint names are positional, and that name is the billing key. A render
+# that moves an existing pkclientN to a different address re-attributes every
+# CDR, concurrency count and transfer-state key that came before it — silently
+# and in the past tense. Say so loudly; the fix is to append, not to reorder.
+if [[ -r "$OUTDIR/pjsip.conf" ]]; then
+  while read -r _n _oldip; do
+    _newip="${PK_CLIENT_LIST[$((_n - 1))]:-}"
+    if [[ -z "$_newip" ]]; then
+      echo "  WARNING: pkclient$_n ($_oldip) is in $OUTDIR/pjsip.conf but PK_CLIENT_IPS" >&2
+      echo "           now has only ${#PK_CLIENT_LIST[@]} entries. That endpoint is being REMOVED:" >&2
+      echo "           traffic from $_oldip will be refused after the next pjsip reload." >&2
+    elif [[ "$_newip" != "$_oldip" ]]; then
+      echo "  WARNING: pkclient$_n was $_oldip and is now $_newip." >&2
+      echo "           Endpoint names are the CDR attribution key. If you reordered" >&2
+      echo "           PK_CLIENT_IPS, past calls from both addresses are now billed to" >&2
+      echo "           the wrong one. Append to the list instead." >&2
+    fi
+  done < <(awk '
+      # Any section header ends the previous section. Without this the
+      # fractelN identifies below would still be carrying the last pkclientN
+      # name and every gateway would report itself as a renumbered customer.
+      /^\[/                 { name=""; ident=0 }
+      /^\[pkclient[0-9]+\]/ { name=$0; gsub(/[][]/,"",name); next }
+      /^type=identify/      { ident=1; next }
+      name != "" && ident && /^match=/ {
+                              ip=$0; sub(/^match=/,"",ip)
+                              n=name; sub(/^pkclient/,"",n); print n, ip; ident=0 }
+    ' "$OUTDIR/pjsip.conf")
+fi
+
+info "customer endpoints: ${#PK_CLIENT_LIST[@]} ($PK_CLIENT_EP_CSV)"
+
 # --- SIP-layer ACL --------------------------------------------------------
 # Asterisk ACL semantics are "last matching rule wins", so the blanket deny
 # goes first and every explicitly permitted peer follows it.
 {
   echo "deny=0.0.0.0/0.0.0.0"
-  echo "permit=$PK_CLIENT_IP_1/32"
-  echo "permit=$PK_CLIENT_IP_2/32"
+  for ip in "${PK_CLIENT_LIST[@]}"; do echo "permit=$ip/32"; done
   IFS=',' read -r -a _fips <<< "$FRACTEL_IP_LIST"
   for ip in "${_fips[@]}"; do echo "permit=$ip/32"; done
   if [[ -n "${EXTRA_SIP_ACL_PERMIT:-}" ]]; then
@@ -351,8 +463,8 @@ info "FracTEL gateways: $FRACTEL_GW_COUNT ($FRACTEL_IP_LIST)"
 } > "$BLOCK_DIR/codecs"
 CODEC_INLINE="$(cat "$BLOCK_DIR/codecs")"
 
-# The generated FracTEL block above carries a nested placeholder; expand it
-# now that the codec list exists.
+# The generated FracTEL and customer blocks above carry a nested placeholder;
+# expand it now that the codec list exists.
 python_free_expand() {
   local f="$1" out=""
   while IFS= read -r l || [[ -n "$l" ]]; do
@@ -365,6 +477,7 @@ python_free_expand() {
   printf '%s' "$out" > "$f"
 }
 python_free_expand "$BLOCK_DIR/fractel_endpoints"
+python_free_expand "$BLOCK_DIR/customer_endpoints"
 
 # --- blocked NPA list, comma-wrapped for the dialplan regex membership test -
 NPA_CSV="$(echo "$BLOCKED_NPAS" | tr ' ' ',' | tr -s ',' | sed 's/^,//; s/,$//')"
@@ -728,8 +841,9 @@ fi
 
 declare -A R=(
   [SBC_PUBLIC_IP]="$SBC_PUBLIC_IP"
-  [PK_CLIENT_IP_1]="$PK_CLIENT_IP_1"
-  [PK_CLIENT_IP_2]="$PK_CLIENT_IP_2"
+  [PK_CLIENT_IP_CSV]="$PK_CLIENT_IP_CSV"
+  [PK_CLIENT_EP_CSV]="$PK_CLIENT_EP_CSV"
+  [PK_CLIENT_COUNT]="${#PK_CLIENT_LIST[@]}"
   [SIP_PORT]="$SIP_PORT"
   [RTP_START]="$RTP_START"
   [RTP_END]="$RTP_END"

@@ -67,6 +67,9 @@ AST="${AST:-asterisk}"
 # shellcheck disable=SC1090
 [[ -f "$CONF" ]] && { set -a; source "$CONF"; set +a; }
 
+# shellcheck source=lib/pk-clients.sh
+[[ -r "$HERE/lib/pk-clients.sh" ]] && . "$HERE/lib/pk-clients.sh"
+
 DID_DAILY_CAP="${DID_DAILY_CAP:-200}"
 CDR_CSV_PATH="${CDR_CSV_PATH:-/var/log/asterisk/cdr-custom/sbc.csv}"
 TRANSFER_MIN_CALLS="${TRANSFER_MIN_CALLS:-3}"
@@ -112,7 +115,16 @@ xfer_endpoints() {
   local eps
   eps="$("$AST" -rx "pjsip show endpoints" 2>/dev/null | grep -oE 'pkclient[0-9]+' | sort -u)"
   [[ -n "$eps" ]] && { echo "$eps"; return; }
-  printf 'pkclient1\npkclient2\n'
+  # Asterisk is not answering. Fall back to what config.env says should exist
+  # rather than to a hardcoded pair, or a pin/suppress applied while the box is
+  # down silently misses the endpoints past the second one.
+  if declare -F pk_client_endpoint_names >/dev/null; then
+    pk_client_endpoint_names
+  else
+    echo "didctl.sh: cannot list customer endpoints — Asterisk is not answering" >&2
+    echo "           and $HERE/lib/pk-clients.sh is missing." >&2
+    return 1
+  fi
 }
 
 # Is this row currently treated as a transfer destination?

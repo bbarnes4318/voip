@@ -28,8 +28,21 @@ AST_LOG="${AST_LOG:-/var/log/asterisk/messages}"
 set -a; source "$CONF"; set +a
 
 SBC="${SBC_PUBLIC_IP:-127.0.0.1}:${SIP_PORT:-5060}"
-PK1="${PK_CLIENT_IP_1:?}"
-PK2="${PK_CLIENT_IP_2:?}"
+
+# shellcheck source=../lib/pk-clients.sh
+[[ -r "$ROOT/lib/pk-clients.sh" ]] || { echo "missing $ROOT/lib/pk-clients.sh"; exit 1; }
+. "$ROOT/lib/pk-clients.sh"
+PK_IPS_RAW="$(pk_client_ips)" || { echo "PK_CLIENT_IPS is unusable in $CONF"; exit 1; }
+mapfile -t PK_IPS <<< "$PK_IPS_RAW"
+PK_EPS=()
+for _i in "${!PK_IPS[@]}"; do PK_EPS+=("pkclient$((_i + 1))"); done
+
+# Most criteria drive one customer address; criterion 6b needs a second to
+# prove the concurrency cap is per-IP and not global. Both come off the list,
+# so a test config with a third address exercises the same suite and criterion
+# 1 additionally proves the third endpoint exists.
+PK1="${PK_IPS[0]:?}"
+PK2="${PK_IPS[1]:?tests need at least two customer IPs — criterion 6b proves the cap is per-IP}"
 UNAUTH="${TEST_UNAUTHORIZED_IP:-}"
 # First entry of FRACTEL_PROXY_IPS, as ip[:port]. Falls back to 5060 when the
 # test config omits the port, rather than silently using the address as a port.
@@ -148,7 +161,7 @@ trap cleanup EXIT
 echo
 echo "SBC acceptance suite"
 echo "  target        $SBC"
-echo "  customer IPs  $PK1 (pkclient1)  $PK2 (pkclient2)"
+echo "  customer IPs  $(for i in "${!PK_IPS[@]}"; do printf '%s (%s)  ' "${PK_IPS[$i]}" "${PK_EPS[$i]}"; done)"
 echo "  fractel stub  $STUB_IP:$STUB_PORT"
 echo "  caps          concurrency=$CAP  cps=$CPS"
 echo "  logs          $LOGDIR"
@@ -206,7 +219,7 @@ echo
 # ===========================================================================
 EP="$(asterisk -rx 'pjsip show endpoints' 2>/dev/null)"
 MISSING=""
-for e in pkclient1 pkclient2 fractel1; do
+for e in "${PK_EPS[@]}" fractel1; do
   grep -q "$e" <<< "$EP" || MISSING+="$e "
 done
 CONTACTS="$(asterisk -rx 'pjsip show contacts' 2>/dev/null | grep 'fractel' || true)"
@@ -228,7 +241,7 @@ elif [[ "${AVAIL:-0}" -lt "$GW_COUNT" ]]; then
   note "criterion 17 cannot measure distribution across gateways that are down"
   note "$(head -3 <<< "$CONTACTS")"
 else
-  pass "crit 1" "pkclient1, pkclient2 and all $GW_COUNT fractel gateways present and Avail"
+  pass "crit 1" "${PK_EPS[*]} and all $GW_COUNT fractel gateways present and Avail"
 fi
 
 # ===========================================================================

@@ -173,8 +173,8 @@ so each of these is a distinct bindable source address:
 | Address | Role |
 |---|---|
 | `127.0.0.1:5060` | the SBC (Asterisk binds `0.0.0.0`) |
-| `127.0.0.11` | customer 1 → matches `pkclient1` |
-| `127.0.0.12` | customer 2 → matches `pkclient2` |
+| `127.0.0.11` | customer 1 → matches `pkclient1` (entry 1 of `PK_CLIENT_IPS`) |
+| `127.0.0.12` | customer 2 → matches `pkclient2` (entry 2) |
 | `127.0.0.20:5080` … `127.0.0.25:5080` | six FracTEL stubs, one per gateway |
 | `127.0.0.99` | unauthorized third party |
 
