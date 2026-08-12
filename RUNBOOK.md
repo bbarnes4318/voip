@@ -420,9 +420,21 @@ INSERT INTO portal.customer_identifiers (customer_id, kind, value, note)
 VALUES (<customer id>, 'source_ip', '<ip>', '<why, and the date>');
 ```
 
-There is a matching `kind='customer_endpoint'` row per endpoint name. Add both:
-CDR attribution can key on either, and one without the other means attribution
-depends on which column the query happened to use.
+`source_ip` is what this deployment attributes on — it is tried first, it is
+populated at the top of the dialplan before any check can reject the call, and
+it is therefore present even on refused calls. `customer_endpoint` and `did`
+identifiers exist as fallbacks and are not in use here; adding one is harmless
+but it is not what makes the call bill.
+
+Confirm the portal resolves it before sending traffic:
+
+```
+GET /api/v1/balance/by/source_ip/<ip>   ->  {"customer_id":"3", ...}
+```
+
+If calls already landed unattributed, the admin **Re-attribute** action
+(`POST /admin/ingest/reattribute`) back-fills them against the new identifier
+and re-rates.
 
 **5. Prove it.** All four in one pass:
 
