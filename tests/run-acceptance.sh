@@ -1106,6 +1106,51 @@ stop_stubs
 start_stubs uas-fractel-stub.xml -rtp_echo >/dev/null
 
 # ===========================================================================
+# Criterion 27 — the deployed files match a recorded commit
+#
+# The SBC is deployed by scp on purpose: a git checkout on a production border
+# element means credentials and a .git directory on the one host terminating
+# customer traffic. The cost is that three hand-copied files correspond to no
+# commit unless something writes it down.
+#
+# This is an acceptance criterion rather than a note because the failure is
+# silent and expensive. A deploy from a clean checkout of the wrong branch
+# reverts Phase 0 -- the ring-aware failover split -- and nothing reports it.
+# Calls quietly start walking the gateway ring again and the only symptom is a
+# slow rise in INVITE volume toward the carrier, which reads as a traffic
+# change rather than as a regression.
+#
+# So a deploy that skips writing DEPLOYED_COMMIT fails the suite instead of
+# passing quietly.
+# ===========================================================================
+echo
+VD="$ROOT/verify-deployment.sh"
+if [[ ! -x "$VD" ]]; then
+  fail "crit 27" "verify-deployment.sh is missing or not executable"
+else
+  VD_OUT="$("$VD" --dir "${SBC_DIR:-/opt/sbc}" 2>&1)"; VD_RC=$?
+  case "$VD_RC" in
+    0) pass "crit 27" "deployed files match the commit recorded in DEPLOYED_COMMIT"
+       note "$(sed -n 's/^  commit  *//p' <<< "$VD_OUT" | head -1)"
+       # A build with unrun criteria is not a failure, but it must not pass
+       # silently either -- criteria 24-26 gate code that is already live.
+       if grep -q 'never executed' <<< "$VD_OUT"; then
+         note "${YEL}$(grep 'never executed' <<< "$VD_OUT" | sed 's/^ *//')${NC}"
+       fi
+       ;;
+    1) fail "crit 27" "DRIFT: the box is not running the commit DEPLOYED_COMMIT records"
+       sed -n '/DRIFT\|MISSING/p' <<< "$VD_OUT" | head -5 | while read -r l; do note "$l"; done
+       note "reconcile before deploying — a clean-checkout deploy will revert whatever"
+       note "the box has that the recorded commit does not"
+       ;;
+    *) fail "crit 27" "cannot verify deployment provenance (exit $VD_RC)"
+       note "$(head -3 <<< "$VD_OUT" | tr '\n' ' ')"
+       note "a box with no DEPLOYED_COMMIT has no provenance; write one before deploying over it"
+       ;;
+  esac
+fi
+
+# ===========================================================================
 echo "==========================================================================="
 printf '  %s%d passed%s, %s%d failed%s, %s%d skipped%s\n' \
   "$GREEN" "$PASS" "$NC" "$RED" "$FAIL" "$NC" "$YEL" "$SKIP" "$NC"
