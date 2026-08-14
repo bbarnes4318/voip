@@ -14,6 +14,11 @@
 #   ./didctl.sh prune [days]        drop counter keys older than <days> (7)
 #   ./didctl.sh set <did> <n>       force a count. TEST TOOL — see below.
 #   ./didctl.sh reset <did>|--all   zero today's counts. Needs --force.
+#   ./didctl.sh reallocate <plan.csv> [--cap N] [--apply]
+#                                   move EXISTING DIDs between pools from a
+#                                   capacity plan. DRY RUN unless --apply.
+#                                   Never purchases. Apply needs a RESTART, not
+#                                   sync-globals — see that section.
 #
 #   ./didctl.sh transfers list      learned transfer destinations, counts, ACD
 #   ./didctl.sh transfers add <n>   pin a destination as a transfer leg
@@ -678,6 +683,279 @@ transfers)
     exit 2
     ;;
   esac
+  ;;
+
+# ---------------------------------------------------------------------------
+# reallocate — move existing DIDs between pools from a capacity plan.
+#
+#   ./didctl.sh reallocate <plan.csv> [--cap N] [--apply] [--force]
+#
+# DRY-RUN BY DEFAULT. Nothing is written without --apply.
+#
+# This NEVER purchases and never invents a number. It only moves numbers the
+# operator already owns between pools in dids.csv, which is the whole point: a
+# moved DID keeps whatever reputation it has, while a purchased one costs money
+# and arrives unseasoned.
+#
+# The plan comes from tools/analyze-did-capacity.py --out. That tool decides
+# WHAT to move; this one executes it and independently re-checks the one
+# invariant that matters, because a planner bug here drains a working pool:
+#
+#     no donor may fall below its own need_at_cap_<cap>
+#
+# Row order in the plan IS the provision order, and rows 1-4 are deliberately
+# the four worst per-DID loads among the 0%-answered NPAs. Doing those first is
+# what makes this a test of the burned-number hypothesis rather than just a
+# capacity change: if their answer rate moves and nothing else changed, DID
+# reputation outranks routing.
+#
+# --- WHY APPLY NEEDS A RESTART, NOT sync-globals ---------------------------
+#
+# `asterisk -rx` truncates somewhere before 506 bytes and reports success while
+# leaving the global at its OLD value — see the sync-globals section above. At
+# ~12 bytes per DID that caps a pool global at roughly 38 numbers. The overflow
+# pool alone is far past that, so pushing pools at runtime is not available:
+# the dialplan would believe it had a pool it could only partly address, and
+# every selection past the addressable end would yield an EMPTY DID and refuse
+# the call.
+#
+# So the apply path rewrites dids.csv only, and tells you to render and RESTART.
+# Asterisk reads [globals] from the file directly at startup, which is the only
+# mechanism that loads a large pool correctly.
+# ---------------------------------------------------------------------------
+reallocate)
+  PLAN="${2:-}"
+  [[ -n "$PLAN" && -r "$PLAN" ]] || die "usage: didctl.sh reallocate <plan.csv> [--cap N] [--apply] [--force]
+       plan.csv comes from: python3 tools/analyze-did-capacity.py --out plan.csv"
+  shift 2
+
+  RC_CAP="$DID_DAILY_CAP"; RC_APPLY=0; RC_FORCE=0
+  RC_DIDS="${DIDS_CSV:-$HERE/dids.csv}"
+  [[ "$RC_DIDS" = /* ]] || RC_DIDS="$HERE/$RC_DIDS"
+  RC_OVERFLOW_MIN="${OVERFLOW_MIN:-20}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cap)   RC_CAP="$2"; shift 2 ;;
+      --dids)  RC_DIDS="$2"; shift 2 ;;
+      --apply) RC_APPLY=1; shift ;;
+      --force) RC_FORCE=1; shift ;;
+      *) die "reallocate: unknown argument '$1'" ;;
+    esac
+  done
+  [[ "$RC_CAP" =~ ^[0-9]+$ ]] || die "--cap must be an integer, got '$RC_CAP'"
+  [[ -r "$RC_DIDS" ]] || die "cannot read DID pool: $RC_DIDS"
+
+  # --- current pools, parsed the way render.sh parses them -----------------
+  declare -A RC_POOL=()      # npa -> "did did did"
+  RC_COMMENTS=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|'#'*) RC_COMMENTS+="$line"$'\n'; continue ;;
+    esac
+    [[ "$line" == *,* ]] || continue
+    _n="${line%%,*}"; _rest="${line#*,}"; _d="${_rest%%,*}"
+    _n="${_n//[[:space:]]/}"; _n="${_n^^}"; _d="${_d//[!0-9]/}"
+    [[ "$_n" == "NPA" || -z "$_d" ]] && continue
+    (( ${#_d} == 10 )) && _d="1$_d"
+    RC_POOL[$_n]="${RC_POOL[$_n]:+${RC_POOL[$_n]} }$_d"
+  done < "$RC_DIDS"
+
+  # --- the plan, columns located BY NAME -----------------------------------
+  # Not by position: analyze-did-capacity.py grows columns as caps are added,
+  # and a positional read would silently pick up the wrong cap's numbers.
+  RC_ROWS="$(awk -F, -v cap="$RC_CAP" '
+    NR==1 { for (i=1;i<=NF;i++) h[$i]=i
+            need="need_at_cap_" cap; ra="reallocate_at_cap_" cap
+            frm="reallocate_from_at_cap_" cap
+            if (!(need in h) || !(ra in h)) {
+              print "MISSINGCOL"; exit 1 }
+            ni=h[need]; ri=h[ra]; fi=(frm in h)?h[frm]:0
+            oi=("provision_order" in h)?h["provision_order"]:0
+            pi=h["pool_size"]; npi=h["npa"]; next }
+    { printf "%s\t%s\t%s\t%s\t%s\t%s\n", $npi, $pi, $ni, $ri, (fi?$fi:""), (oi?$oi:NR) }
+  ' "$PLAN")"
+  [[ "$RC_ROWS" == MISSINGCOL* ]] && die \
+    "plan has no need_at_cap_$RC_CAP / reallocate_at_cap_$RC_CAP column.
+       Regenerate it with a matching --caps, or pass --cap to match the plan."
+  [[ -n "$RC_ROWS" ]] || die "plan $PLAN produced no rows"
+
+  # need_at_cap for every NPA, so the donor guard can be re-checked here
+  # instead of trusted from the planner.
+  declare -A RC_NEED=() RC_PLANPOOL=()
+  while IFS=$'\t' read -r npa pool need ra frm ord; do
+    [[ -n "$npa" ]] || continue
+    RC_NEED[$npa]="$need"; RC_PLANPOOL[$npa]="$pool"
+  done <<< "$RC_ROWS"
+
+  # --- pick which DIDs move ------------------------------------------------
+  # Least-used first, summed across every didcnt day still in astdb. Capacity
+  # does not care which number moves; reputation does. The recipients here are
+  # the pools whose two or three numbers have been running at the ceiling, so
+  # handing them the donor's IDLEST numbers is the point of the exercise.
+  # Falls back to a stable sort when Asterisk is not answering, so this stays
+  # usable on a box that is down.
+  declare -A RC_USED=()
+  if "$AST" -rx "core show version" >/dev/null 2>&1; then
+    while IFS=$'\t' read -r k v; do
+      _d="${k##*/}"
+      [[ "$_d" =~ ^[0-9]+$ ]] || continue
+      RC_USED[$_d]=$(( ${RC_USED[$_d]:-0} + v ))
+    done < <(db_show "sbc/didcnt")
+    RC_RANKSRC="astdb usage (idlest first)"
+  else
+    RC_RANKSRC="${Y}stable order — Asterisk unreachable, no usage data${N}"
+  fi
+
+  # Sets RC_TAKEN rather than echoing, and is called WITHOUT command
+  # substitution. $(rc_take ...) would run it in a subshell, so the RC_POOL
+  # update below would be discarded and every donor would keep handing out the
+  # same numbers -- silently, since the recipients still add up.
+  rc_take() { # rc_take <donor-npa> <n>  -> sets RC_TAKEN
+    local d="$1" want="$2" got=0 keep="" x
+    RC_TAKEN=""
+    # shellcheck disable=SC2086
+    for x in $(for y in ${RC_POOL[$d]:-}; do
+                 printf '%s %s\n' "${RC_USED[$y]:-0}" "$y"; done \
+               | sort -n -k1,1 -k2,2 | awk '{print $2}'); do
+      if (( got < want )); then RC_TAKEN+="${RC_TAKEN:+ }$x"; got=$((got+1))
+      else keep+="${keep:+ }$x"; fi
+    done
+    RC_POOL[$d]="$keep"
+  }
+
+  echo
+  echo "${B}DID reallocation${N}   plan $(basename "$PLAN")   cap ${RC_CAP}/DID/day"
+  if (( RC_APPLY )); then
+    echo "  mode: ${R}APPLY${N}   pool file: $RC_DIDS"
+  else
+    echo "  mode: ${G}DRY RUN${N}  (nothing will be written — add --apply)"
+  fi
+  echo "  selection: $RC_RANKSRC"
+  echo
+
+  declare -A RC_BEFORE=()
+  for k in "${!RC_POOL[@]}"; do
+    RC_BEFORE[$k]="$(wc -w <<< "${RC_POOL[$k]}")"
+  done
+
+  RC_MOVES=0; RC_BLOCKED=0; RC_LINES=""
+  # Provision order. 336/337/316/609 are rows 1-4 by construction.
+  while IFS=$'\t' read -r npa pool need ra frm ord; do
+    [[ -n "$npa" && "$npa" != "OVERFLOW" ]] || continue
+    (( ra > 0 )) || continue
+    [[ -n "$frm" ]] || continue
+
+    for pair in ${frm//|/ }; do
+      src="${pair%%:*}"; cnt="${pair##*:}"
+      [[ "$cnt" =~ ^[0-9]+$ ]] || die "plan: malformed source '$pair' for NPA $npa"
+
+      have="$(wc -w <<< "${RC_POOL[$src]:-}")"
+      # THE GUARD. Re-derived here rather than trusted: the donor's own need at
+      # this cap, or OVERFLOW_MIN for the overflow pool, whichever applies.
+      if [[ "$src" == "OVERFLOW" ]]; then
+        floor="$RC_OVERFLOW_MIN"
+      else
+        floor="${RC_NEED[$src]:-0}"
+      fi
+      if (( have - cnt < floor )); then
+        RC_LINES+="  ${R}BLOCKED${N}  $src -> $npa  ${cnt} DID(s): would leave $src with $(( have - cnt )), below its own need of ${floor}"$'\n'
+        RC_BLOCKED=$((RC_BLOCKED + 1))
+        continue
+      fi
+
+      rc_take "$src" "$cnt"
+      moved="$RC_TAKEN"
+      nmoved="$(wc -w <<< "$moved")"
+      if (( nmoved < cnt )); then
+        RC_LINES+="  ${R}BLOCKED${N}  $src -> $npa  wanted ${cnt}, pool holds only ${nmoved}"$'\n'
+        RC_BLOCKED=$((RC_BLOCKED + 1))
+        RC_POOL[$src]="${RC_POOL[$src]:+${RC_POOL[$src]} }$moved"
+        continue
+      fi
+      RC_POOL[$npa]="${RC_POOL[$npa]:+${RC_POOL[$npa]} }$moved"
+      RC_MOVES=$((RC_MOVES + nmoved))
+      RC_LINES+="  ${G}move${N}     $src -> $npa  ${nmoved} DID(s): $moved"$'\n'
+    done
+  done <<< "$(sort -t$'\t' -k6,6n <<< "$RC_ROWS")"
+
+  printf '%s' "$RC_LINES"
+  echo
+
+  # --- before / after, every pool that changed ----------------------------
+  echo "  ${B}pool sizes${N}"
+  printf '  %-10s %8s %8s %8s %8s\n' "pool" "before" "after" "need" "verdict"
+  for k in $(printf '%s\n' "${!RC_POOL[@]}" | sort); do
+    after="$(wc -w <<< "${RC_POOL[$k]}")"
+    before="${RC_BEFORE[$k]:-0}"
+    (( before == after )) && continue
+    if [[ "$k" == "OVERFLOW" ]]; then need="$RC_OVERFLOW_MIN"; else need="${RC_NEED[$k]:-?}"; fi
+    verdict="ok"
+    [[ "$need" =~ ^[0-9]+$ ]] && (( after < need )) && verdict="${Y}under${N}"
+    printf '  %-10s %8d %8d %8s %8b\n' "$k" "$before" "$after" "$need" "$verdict"
+  done
+  echo
+  echo "  ${B}totals${N}  moved ${RC_MOVES} DID(s)"
+  (( RC_BLOCKED )) && echo "          ${R}${RC_BLOCKED} move(s) BLOCKED by the donor guard${N}"
+
+  # Pools still short after every free move. This is the purchase.
+  short=0
+  for k in "${!RC_NEED[@]}"; do
+    [[ "$k" == "OVERFLOW" ]] && continue
+    after="$(wc -w <<< "${RC_POOL[$k]:-}")"
+    (( after < RC_NEED[$k] )) && short=$(( short + RC_NEED[$k] - after ))
+  done
+  echo "          ${short} DID(s) still short after reallocation — that is the purchase"
+  echo
+
+  if (( ! RC_APPLY )); then
+    echo "  ${G}Dry run. $RC_DIDS is unchanged.${N}"
+    echo "  Re-run with --apply once this output has been approved."
+    echo
+    exit 0
+  fi
+
+  (( RC_BLOCKED == 0 || RC_FORCE == 1 )) || die \
+    "$RC_BLOCKED move(s) were blocked by the donor guard. Refusing to apply a
+       partial plan: the pools that DID move would be sized for a plan that was
+       not fully executed. Fix the plan, or pass --force to apply what fits."
+
+  RC_BAK="$RC_DIDS.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$RC_DIDS" "$RC_BAK" || die "could not back up $RC_DIDS"
+
+  {
+    printf '%s' "$RC_COMMENTS"
+    printf '# Pools rewritten by didctl.sh reallocate on %s from %s.\n' \
+      "$(date '+%F %T')" "$(basename "$PLAN")"
+    printf '# %d DID(s) moved between pools. No numbers were purchased.\n' "$RC_MOVES"
+    printf '# Previous file: %s\n' "$(basename "$RC_BAK")"
+    for k in $(printf '%s\n' "${!RC_POOL[@]}" | grep -v OVERFLOW | sort); do
+      for d in ${RC_POOL[$k]}; do printf '%s,%s\n' "$k" "$d"; done
+    done
+    for d in ${RC_POOL[OVERFLOW]:-}; do printf 'OVERFLOW,%s\n' "$d"; done
+  } > "$RC_DIDS.new" || die "could not write $RC_DIDS.new"
+
+  # Never leave the pool file half-written: a truncated dids.csv fails the
+  # render, and a render that fails on a box mid-change is the worst moment
+  # for it.
+  mv "$RC_DIDS.new" "$RC_DIDS" || die "could not replace $RC_DIDS"
+  echo "  ${G}applied${N}: $RC_DIDS rewritten, backup at $(basename "$RC_BAK")"
+  echo
+  echo "  ${B}${R}NOT LIVE YET.${N} The running dialplan still has the old pools."
+  echo
+  echo "  Render and RESTART — not sync-globals:"
+  echo "      sudo ./render.sh -o /etc/asterisk"
+  echo "      sudo systemctl restart asterisk"
+  echo
+  echo "  ${D}sync-globals cannot load these. 'asterisk -rx' truncates before 506${N}"
+  echo "  ${D}bytes and reports success while keeping the OLD value, which caps a${N}"
+  echo "  ${D}pool global at roughly 38 numbers. A partly-addressable pool yields${N}"
+  echo "  ${D}an EMPTY DID past its addressable end and refuses the call. Asterisk${N}"
+  echo "  ${D}reads [globals] from the file at startup, so a restart is the only${N}"
+  echo "  ${D}mechanism that loads a large pool correctly.${N}"
+  echo
+  echo "  Rollback:  cp -a $RC_BAK $RC_DIDS && sudo ./render.sh -o /etc/asterisk && sudo systemctl restart asterisk"
+  echo
   ;;
 
 # ---------------------------------------------------------------------------
