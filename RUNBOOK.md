@@ -1041,3 +1041,35 @@ global and checks the daily cap; nothing else. The `S` flag elsewhere in
 `didctl.sh` is transfer-destination state under `sbc/xfer/...` and has no
 bearing on DID selection. Removing a number from the pool is the only thing that
 takes it out of rotation today. Building a real per-DID cooldown is Phase 6.
+
+#### 316 and 609 carry one incumbent each — interpret their readings with it
+
+The four experiment NPAs are **not** equally clean, and the difference is
+deliberate.
+
+Suppressing the incumbents left all four below their need, so all four still
+exceed the 200 cap and spill to overflow. Two contaminants were available and
+they are not symmetric:
+
+- **A restored incumbent is a known quantity.** One identifiable number with a
+  usage history. ASR can be measured with and without it and the number
+  subtracted out afterwards.
+- **Overflow blending is not.** Those calls land on whichever shared numbers the
+  pool hands out, at whatever load those numbers happen to be carrying. The
+  effect cannot be separated after the fact.
+
+So 316 and 609 — which were spilling 19% and 28% to overflow on 3 and 2 numbers
+— had their incumbents restored, trading an unmeasurable contaminant for a
+measurable one. 609 at 3 numbers against 559 calls is still 186/number and still
+spills at peak, but the spill is small enough to reason about.
+
+| NPA | pool | incumbent restored | spill | reading |
+|---|---|---|---|---|
+| 336 | 14 | no | ~11% | **primary** — 1,572 → 224 calls/number |
+| 337 | 6 | no | ~2% | **primary** |
+| 316 | 4 | yes (`13168166005`) | reduced | subtract the incumbent |
+| 609 | 3 | yes (`16099666107`) | reduced | subtract the incumbent |
+
+**336 is the experiment.** It is the largest load reduction, the cleanest
+signal, and the one to read first. 316 and 609 are corroboration, not evidence
+on their own.
