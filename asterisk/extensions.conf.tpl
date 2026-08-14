@@ -20,7 +20,8 @@
 ;   6. concurrency     per customer IP
 ;   7. DID selection   NPA pool -> overflow, with a per-DID daily cap
 ;   8. caller ID SET   From / PAI / RPID all forced to the selected DID
-;   9. dial            FracTEL, round-robin, failover across all gateways
+;   9. dial            FracTEL, round-robin, failover capped at
+;                      SBC_MAX_ATTEMPTS INVITEs and refused after ringing
 ;
 ; Destination is checked before the concurrency slot is taken, so a burst of
 ; junk destinations cannot starve legitimate traffic out of the cap. DID
@@ -76,6 +77,13 @@ SBC_VALIDATE_CID=@@VALIDATE_CALLERID@@
 SBC_NORMALIZE_CID=@@NORMALIZE_CALLERID@@
 SBC_DIAL_TIMEOUT=@@DIAL_TIMEOUT@@
 SBC_GW_COUNT=@@FRACTEL_GW_COUNT@@
+; Total INVITEs toward the carrier per customer call, first attempt included.
+; render.sh has already clamped this to min(MAX_ROUTE_ATTEMPTS, gateway count),
+; so the dialplan has exactly one bound to check.
+SBC_MAX_ATTEMPTS=@@SBC_MAX_ATTEMPTS@@
+; Below this many milliseconds, a failure that never rang is the trunk saying
+; no rather than a person saying no. See the failover block in [sbc-customer].
+SBC_FAST_REJECT_MS=@@FAST_REJECT_MS@@
 SBC_DID_CAP=@@DID_DAILY_CAP@@
 SBC_XFER_ON=@@TRANSFER_DETECT@@
 SBC_XFER_TF_NPAS=@@SBC_TF_NPAS@@
@@ -447,23 +455,80 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
 
  same => n(gwloop),Set(SBC_GW=${GLOBAL(FRACTEL_GW_${SBC_GWIDX})})
  same => n,Set(CDR(fractel_gateway_used)=${SBC_GW})
- same => n,Log(NOTICE,SBC-DIAL callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} custcid=${SBC_CID_RAW} did=${SBC_DID} didreason=${SBC_DID_REASON} didcount=${SBC_DID_COUNT} xfer=${SBC_XFER} asserted=${CALLERID(num)} dst=${SBC_DEST} gw=${SBC_GW} attempt=${SBC_TRY})
+ same => n,Log(NOTICE,SBC-DIAL callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} custcid=${SBC_CID_RAW} did=${SBC_DID} didreason=${SBC_DID_REASON} didcount=${SBC_DID_COUNT} xfer=${SBC_XFER} asserted=${CALLERID(num)} dst=${SBC_DEST} gw=${SBC_GW} attempt=${SBC_TRY} maxattempts=${SBC_MAX_ATTEMPTS})
+
+ ; Clear app_dial's timing variables BEFORE dialling. On a second attempt the
+ ; previous attempt's values are still sitting on this channel, and
+ ; classifying attempt 2 with attempt 1's ring time would read a silent proxy
+ ; failure as a consumer decline — the failure this whole block exists to
+ ; avoid, arriving one attempt later. Empty is read as zero below, so a Dial()
+ ; return path that never sets them degrades to "did not ring" rather than to
+ ; stale data from the previous gateway.
+ same => n,Set(RINGTIME_MS=)
+ same => n,Set(DIALEDTIME_MS=)
  ; No Dial() options at all. No t/T (no transfer), no g/G, no M/L. The only
  ; thing this leg can do is connect two RTP streams through this box.
  same => n,Dial(PJSIP/${SBC_DEST}@${SBC_GW},${SBC_DIAL_TIMEOUT})
  same => n,Set(SBC_DS=${DIALSTATUS})
- same => n,NoOp(SBC dialstatus=${SBC_DS} cause=${HANGUPCAUSE} gw=${SBC_GW})
+ ; Read immediately after Dial() returns, while HANGUPCAUSE still holds the
+ ; cause from the channel just dialled. By the time the h extension runs it
+ ; has been overwritten by this dialplan's own Hangup().
+ same => n,Set(SBC_CAUSE=${HANGUPCAUSE})
+ same => n,Set(SBC_RING_MS=${IF($["${RINGTIME_MS}" != ""]?${RINGTIME_MS}:0)})
+ same => n,Set(SBC_DIAL_MS=${IF($["${DIALEDTIME_MS}" != ""]?${DIALEDTIME_MS}:0)})
+ ; One line per INVITE. This is what lets Phase 2 separate a network reject
+ ; from a human decline retroactively: cause=21 with ring_ms>0 is a person
+ ; declining, cause=21 with ring_ms=0 in under a second is the trunk.
+ same => n,Log(NOTICE,SBC-ATTEMPT callid=${SBC_CALLID} ep=${SBC_EP} dst=${SBC_DEST} gw=${SBC_GW} attempt=${SBC_TRY} status=${SBC_DS} cause=${SBC_CAUSE} ring_ms=${SBC_RING_MS} dialed_ms=${SBC_DIAL_MS})
 
- ; Fail over only on trunk-level failures. BUSY and NOANSWER are real answers
- ; from the far end; retrying those on another gateway would dial the same
- ; consumer twice and is how you generate complaints.
+ ; ---- failover classification --------------------------------------------
+ ; CONGESTION is a trunk-level failure — 503, and the transport-level failures
+ ; that never produced a response at all. The call did not reach a consumer,
+ ; so another proxy is worth one try.
  same => n,GotoIf($["${SBC_DS}" = "CONGESTION"]?gwnext)
- same => n,GotoIf($["${SBC_DS}" = "CHANUNAVAIL"]?gwnext)
+ ; Anything that is neither CONGESTION nor CHANUNAVAIL is a real answer from
+ ; the far end — ANSWER, BUSY (486/600), NOANSWER. Never retried. This is the
+ ; original rule and it is unchanged.
+ same => n,GotoIf($["${SBC_DS}" != "CHANUNAVAIL"]?finish)
+
+ ; CHANUNAVAIL is ambiguous, and the ambiguity was doing real harm.
+ ;
+ ; 603 Decline maps to AST_CAUSE_CALL_REJECTED (21), and app_dial reports that
+ ; as CHANUNAVAIL — the identical DIALSTATUS an unreachable proxy produces.
+ ; chan_pjsip queues control frames only for 180, 183 and 200, so no 4xx or
+ ; 6xx ever becomes AST_CONTROL_BUSY and the hangupcause path is the only one
+ ; that runs. CHANUNAVAIL was already a failover condition, so every consumer
+ ; who pressed decline was redialled across the remaining gateways — exactly
+ ; the behaviour the comment here has always claimed to prevent.
+ ;
+ ; It is worse than merely useless: every gateway is a proxy on ONE
+ ; subaccount reaching ONE upstream, so the rejection comes back identically
+ ; from each of them. Measured on this box, 60% of the calls that failed over
+ ; once went on to burn every remaining gateway.
+ ;
+ ; The discriminator is whether the call ever rang. A consumer can only
+ ; decline a call that reached their handset, and reaching the handset means
+ ; a 180 came back, which is what RINGTIME_MS records.
+ same => n,GotoIf($[${SBC_RING_MS} > 0]?declined)
+ ; Never rang, but took long enough that this is not a fast trunk-level
+ ; refusal either. Ambiguous, so take the side that does not dial a consumer
+ ; twice.
+ same => n,GotoIf($[${SBC_DIAL_MS} >= ${SBC_FAST_REJECT_MS}]?declined)
+ same => n,Goto(gwnext)
+
+ same => n(declined),Log(NOTICE,SBC-NO-RETRY callid=${SBC_CALLID} ep=${SBC_EP} dst=${SBC_DEST} gw=${SBC_GW} status=${SBC_DS} cause=${SBC_CAUSE} ring_ms=${SBC_RING_MS} dialed_ms=${SBC_DIAL_MS} note=far-end-rejected-this-call-not-retrying)
  same => n,Goto(finish)
 
  same => n(gwnext),Set(SBC_TRY=$[${SBC_TRY} + 1])
- same => n,Log(NOTICE,SBC-FAILOVER callid=${SBC_CALLID} gw=${SBC_GW} status=${SBC_DS} attempt=${SBC_TRY})
- same => n,GotoIf($[${SBC_TRY} >= ${SBC_GW_COUNT}]?rej_exhausted)
+ same => n,Log(NOTICE,SBC-FAILOVER callid=${SBC_CALLID} gw=${SBC_GW} status=${SBC_DS} cause=${SBC_CAUSE} ring_ms=${SBC_RING_MS} attempt=${SBC_TRY})
+ ; SBC_TRY is now the number of INVITEs already sent for this call, so this is
+ ; a cap on INVITES PER CALL and not on gateways. Walking the whole ring was
+ ; never the right behaviour: with one subaccount behind every proxy, attempt
+ ; five returns what attempt one returned, while the carrier sees five times
+ ; the CPS and a worse-looking traffic profile than the traffic actually is.
+ ; render.sh has already clamped SBC_MAX_ATTEMPTS to the gateway count, so a
+ ; single-gateway box cannot redial the same proxy here.
+ same => n,GotoIf($[${SBC_TRY} >= ${SBC_MAX_ATTEMPTS}]?rej_exhausted)
  same => n,Set(SBC_GWIDX=$[( ${SBC_GWIDX} % ${SBC_GW_COUNT} ) + 1])
  same => n,Goto(gwloop)
 

@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  uas-fractel-stub-silent.xml — carrier stub that accepts the INVITE and then
+  never sends a final response.
+
+    sipp -sf uas-fractel-stub-silent.xml -i 127.0.0.20 -p 5080 -nostdin
+
+  Models a proxy that is listening but wedged: the SBC's Dial() runs to
+  DIAL_TIMEOUT and returns NOANSWER. Unlike a filtered address (which fails
+  fast at the transport layer and yields CONGESTION), this one consumes the
+  full timeout, so it is the scenario that shows post-dial delay compounding
+  when the attempt cap is set too high.
+
+  The 100 Trying is deliberate. Without it the SBC would retransmit the INVITE
+  on timer A and the test would be measuring retransmission rather than the
+  dialplan. With it, the transaction is confirmed proceeding and the only
+  thing left to expire is the Dial() timeout.
+
+  No 180 is sent, so RINGTIME_MS stays 0 — but DIALEDTIME_MS will be far above
+  FAST_REJECT_SECONDS, which is what makes this the test for the "never rang
+  but slow" branch. That branch deliberately does NOT retry: a call that hung
+  for the full timeout is ambiguous, and the safe side of an ambiguous call is
+  the one that does not dial a consumer twice.
+
+  timewait has to outlast DIAL_TIMEOUT (60s by default, and tests/config.test.env
+  lowers it) or SIPp reaps the call before the SBC gives up and the scenario
+  reports a false failure.
+
+  Name keeps the 'uas-fractel-stub' prefix for run-acceptance.sh's stub reaping.
+-->
+
+<scenario name="FracTEL stub - silent, no final response">
+
+  <recv request="OPTIONS" optional="true" next="options_reply"/>
+
+  <recv request="INVITE" crlf="true"/>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 100 Trying
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Nothing further, on purpose. The SBC is left to time out. A CANCEL
+       arrives when it does; answer it so the transaction closes cleanly
+       instead of leaving SIPp retransmitting into a dead dialog. -->
+  <recv request="CANCEL" optional="true" crlf="true"/>
+
+  <send next="0">
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <timewait milliseconds="90000"/>
+
+  <label id="options_reply"/>
+  <send next="0">
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTagOpt[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <ResponseTimeRepartition value="10, 50, 100, 200, 500, 1000"/>
+
+</scenario>

@@ -503,9 +503,41 @@ down again after 90 seconds unless you run `firewall.sh confirm` from a second
 session. Locking yourself out of a remote Hetzner box on test-day eve is a
 real failure mode.
 
-**Failover does not retry BUSY or NOANSWER.** Only `CONGESTION` and
-`CHANUNAVAIL` walk to the next gateway. Retrying a busy signal on another
-proxy dials the same consumer twice, and that generates complaints.
+**Failover does not retry a call the far end rejected, and "the far end
+rejected it" is decided on ringing rather than on `DIALSTATUS`.** Retrying a
+call a consumer actually declined dials them twice, and that generates
+complaints.
+
+That intent is original to this box. The implementation did not match it until
+2026-08, and the gap is worth understanding before anyone simplifies this back:
+
+`603 Decline` — a human pressing decline — maps to `AST_CAUSE_CALL_REJECTED`,
+which `app_dial` reports as **`CHANUNAVAIL`**, the same `DIALSTATUS` an
+unreachable proxy produces. `chan_pjsip` queues control frames only for 180,
+183 and 200, so no 4xx or 6xx becomes `AST_CONTROL_BUSY` and the hangupcause
+path is the only one that runs. `CHANUNAVAIL` was a failover condition, so
+every declined call walked the remaining ring.
+
+So the condition is now split on `${RINGTIME_MS}`:
+
+| Outcome | Retried? | Why |
+|---|---|---|
+| `CONGESTION` | yes | trunk-level; the call never reached anyone |
+| `CHANUNAVAIL`, never rang, failed under `FAST_REJECT_SECONDS` | yes | the trunk refused it, not a person |
+| `CHANUNAVAIL`, rang | **no** | only a handset can ring, and only a person can decline |
+| `CHANUNAVAIL`, never rang but slow | **no** | ambiguous, so take the side that does not dial twice |
+| `BUSY` / `NOANSWER` / `ANSWER` | no | unchanged — a real answer from the far end |
+
+**`MAX_ROUTE_ATTEMPTS` (default 2) caps INVITEs per call, and that cap is on
+INVITEs rather than on gateways.** Every entry in `FRACTEL_PROXY_IPS` is a
+proxy on one subaccount reaching one upstream, so a far-end rejection returns
+identically from each of them; the fifth attempt learns nothing the first did
+not. Measured here over 2026-08-11..12, the ring was producing **2.48 INVITEs
+per customer call** at depth 7 and 1.67 at depth 6, with 26.6% of dialled calls
+burning the entire ring before failing. That multiplies the CPS the carrier
+sees and makes the traffic look materially worse to their fraud system than it
+is. `render.sh` clamps the cap to the gateway count, so a single-gateway box
+cannot redial the same proxy.
 
 ## Isolation from `hoppwhistle`
 

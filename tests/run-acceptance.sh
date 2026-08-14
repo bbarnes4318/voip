@@ -1020,6 +1020,92 @@ else
 fi
 
 # ===========================================================================
+# Criteria 24-26 — failover is classified on RINGING, not on DIALSTATUS
+#
+# 603 Decline maps to AST_CAUSE_CALL_REJECTED, which app_dial reports as
+# DIALSTATUS=CHANUNAVAIL — the SAME status an unreachable proxy produces.
+# CHANUNAVAIL is a failover condition, so before this split every consumer who
+# pressed decline was redialled on the remaining gateways: the exact behaviour
+# the failover comment has always claimed to prevent.
+#
+# These three criteria hold the response code CONSTANT at 603 and vary only
+# whether a 180 was sent. Same code, opposite retry behaviour, and the ring is
+# the only difference — that is the whole assertion.
+# ===========================================================================
+DECL_DST="12125550188"
+ATTEMPTS_FOR() { # ATTEMPTS_FOR <mark> <destination>  -> INVITEs the SBC sent
+  since "$1" | grep 'SBC-ATTEMPT ' | grep -cF "dst=$2 " 2>/dev/null || true
+}
+
+echo
+stop_stubs
+
+# --- criterion 24: rang, then declined -> exactly one INVITE ---------------
+UPR="$(start_stubs uas-fractel-stub-ring-reject.xml -key code 603 -key reason Decline)"
+if [[ "${UPR:-0}" -lt "$GW_COUNT" ]]; then
+  fail "crit 24" "only ${UPR:-0} of $GW_COUNT ring-reject stubs started"
+else
+  sleep 2
+  M="$(mark)"
+  sipp_run declined uac-invite.xml destinations-decline.csv "$PK1" 5075 -m 1 || true
+  sleep 3
+  N_RING="$(ATTEMPTS_FOR "$M" "$DECL_DST")"
+  NORETRY="$(since "$M" | grep -c 'SBC-NO-RETRY' 2>/dev/null || true)"
+  if [[ "$N_RING" -eq 1 && "$NORETRY" -ge 1 ]]; then
+    pass "crit 24" "603 after ringing produced exactly 1 INVITE and logged SBC-NO-RETRY"
+  elif [[ "$N_RING" -gt 1 ]]; then
+    fail "crit 24" "603 after ringing produced $N_RING INVITEs — the consumer was redialled $((N_RING - 1)) time(s)"
+    note "this is the pre-Phase-0 bug: CHANUNAVAIL is being retried without checking RINGTIME_MS"
+  else
+    fail "crit 24" "expected 1 INVITE and an SBC-NO-RETRY line, got $N_RING INVITE(s) and $NORETRY SBC-NO-RETRY"
+  fi
+fi
+stop_stubs
+
+# --- criterion 25: same code, no ring -> retried, and capped ---------------
+# The control for criterion 24. Identical 603, no 180, so the call never
+# reached a handset and trying another proxy is legitimate.
+MAXATT="$(asterisk -rx 'dialplan show globals' 2>/dev/null \
+          | sed -n 's/.*SBC_MAX_ATTEMPTS=\([0-9]\{1,\}\).*/\1/p' | head -1)"
+MAXATT="${MAXATT:-2}"
+UPI="$(start_stubs uas-fractel-stub-reject.xml -key code 603 -key reason Decline)"
+if [[ "${UPI:-0}" -lt "$GW_COUNT" ]]; then
+  fail "crit 25" "only ${UPI:-0} of $GW_COUNT immediate-reject stubs started"
+  fail "crit 26" "same"
+else
+  sleep 2
+  M="$(mark)"
+  sipp_run declfast uac-invite.xml destinations-decline.csv "$PK1" 5076 -m 1 || true
+  sleep 3
+  N_FAST="$(ATTEMPTS_FOR "$M" "$DECL_DST")"
+  FO="$(since "$M" | grep -c 'SBC-FAILOVER' 2>/dev/null || true)"
+
+  if [[ "$N_FAST" -ge 2 && "$FO" -ge 1 ]]; then
+    pass "crit 25" "603 with no ringing failed over: $N_FAST INVITEs, $FO SBC-FAILOVER line(s)"
+  elif [[ "$N_FAST" -eq 1 ]]; then
+    fail "crit 25" "a fast 603 with no ringing was not retried — the retry path is now too narrow"
+    note "check FAST_REJECT_SECONDS: the stub answers instantly, so DIALEDTIME_MS should be well under it"
+  else
+    fail "crit 25" "expected >=2 INVITEs and a failover, got $N_FAST INVITE(s) and $FO failover(s)"
+  fi
+
+  # --- criterion 26: the attempt cap is a hard ceiling ---------------------
+  # Every gateway refuses, so this call walks as far as it is allowed to. That
+  # makes it the worst case for INVITE amplification and the exact thing
+  # MAX_ROUTE_ATTEMPTS exists to bound.
+  if [[ "$N_FAST" -le "$MAXATT" ]]; then
+    pass "crit 26" "attempt cap held: $N_FAST INVITE(s) against SBC_MAX_ATTEMPTS=$MAXATT with every gateway refusing"
+    note "unbounded, this call would have sent one INVITE per gateway ($GW_COUNT)"
+  else
+    fail "crit 26" "$N_FAST INVITEs sent against a cap of $MAXATT"
+    note "the ring is not being bounded — every declined call multiplies CPS toward the carrier"
+  fi
+fi
+
+stop_stubs
+start_stubs uas-fractel-stub.xml -rtp_echo >/dev/null
+
+# ===========================================================================
 echo "==========================================================================="
 printf '  %s%d passed%s, %s%d failed%s, %s%d skipped%s\n' \
   "$GREEN" "$PASS" "$NC" "$RED" "$FAIL" "$NC" "$YEL" "$SKIP" "$NC"

@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  uas-fractel-stub-reject.xml — carrier stub that refuses WITHOUT ringing.
+
+  The response code is a parameter, so one file covers 503, 403, 404, 486 and
+  the 603-immediate case that Phase 0 turns on:
+
+    sipp -sf uas-fractel-stub-reject.xml -i 127.0.0.20 -p 5080 -nostdin \
+         -key code 603 -key reason Decline
+
+  WHY THE RING IS STRUCTURAL AND THE CODE IS A KEYWORD
+
+  The dialplan classifies a failure on whether the call ever rang, not on the
+  response code — see the failover block in [sbc-customer]. Whether a 180 is
+  sent is therefore the thing under test, and it is a whole message rather
+  than a substitution, so it is a separate file:
+
+    uas-fractel-stub-reject.xml       no 180  -> RINGTIME_MS stays 0 -> RETRY
+    uas-fractel-stub-ring-reject.xml  180     -> RINGTIME_MS > 0     -> NO RETRY
+
+  Sending the same code down both paths and getting different retry behaviour
+  is exactly the assertion Phase 0 needs, and it is only expressible with the
+  code held constant and the ringing varied.
+
+  The name keeps the 'uas-fractel-stub' prefix on purpose: run-acceptance.sh
+  starts and reaps the stub farm with pgrep/pkill -f 'uas-fractel-stub'.
+
+  NOTE: -key is SIPp's generic keyword mechanism; an unset keyword makes SIPp
+  exit at parse time rather than silently sending something else, which is the
+  failure mode you want. Confirm with the command above before relying on it.
+-->
+
+<scenario name="FracTEL stub - reject without ringing">
+
+  <!-- Keep qualify OPTIONS happy so the AOR still shows Avail. -->
+  <recv request="OPTIONS" optional="true" next="options_reply"/>
+
+  <recv request="INVITE" crlf="true"/>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 100 Trying
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- No 180 Ringing. This is the whole point of this scenario: the call
+       never reached a handset, so app_dial leaves RINGTIME_MS at 0 and the
+       dialplan is entitled to try the next gateway. -->
+
+  <send retrans="500">
+    <![CDATA[
+
+      SIP/2.0 [code] [reason]
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- The transaction layer ACKs a non-2xx final response. Optional so a
+       retransmitted final does not strand the scenario. -->
+  <recv request="ACK" optional="true" rtd="true" crlf="true"/>
+
+  <timewait milliseconds="1000"/>
+
+  <label id="options_reply"/>
+  <send next="0">
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTagOpt[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <ResponseTimeRepartition value="10, 50, 100, 200, 500, 1000"/>
+
+</scenario>

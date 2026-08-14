@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  uas-fractel-stub-ring-reject.xml — carrier stub that RINGS and then refuses.
+
+  This is the scenario that models a human pressing decline, and it is the one
+  the Phase 0 hotfix exists for:
+
+    sipp -sf uas-fractel-stub-ring-reject.xml -i 127.0.0.20 -p 5080 -nostdin \
+         -key code 603 -key reason Decline
+
+  603 Decline maps to AST_CAUSE_CALL_REJECTED, which app_dial reports as
+  DIALSTATUS=CHANUNAVAIL — the same status an unreachable proxy produces.
+  CHANUNAVAIL was a failover condition, so before Phase 0 this scenario caused
+  the SBC to redial the consumer on every remaining gateway. The assertion is
+  that it now produces exactly ONE INVITE.
+
+  Pair it with uas-fractel-stub-reject.xml using the SAME code: identical
+  response, opposite retry behaviour, and the only difference is the 180.
+
+  Also covers 486 Busy Here after ringing (which app_dial already reported as
+  BUSY and never retried) — useful as the control case that proves the new
+  classification did not change behaviour that was already correct.
+
+  The 2000ms ring pause is fixed rather than parameterised. RINGTIME_MS > 0 is
+  what the dialplan branches on, so the exact duration is not under test, and
+  keeping it a literal avoids depending on keyword substitution inside a pause
+  attribute.
+
+  Name keeps the 'uas-fractel-stub' prefix so run-acceptance.sh's pgrep/pkill
+  stub reaping still finds it.
+-->
+
+<scenario name="FracTEL stub - ring then reject">
+
+  <recv request="OPTIONS" optional="true" next="options_reply"/>
+
+  <recv request="INVITE" crlf="true"/>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 100 Trying
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- THE 180. This is what sets RINGTIME_MS non-zero on the SBC and makes
+       the dialplan treat the refusal below as a person rather than a trunk. -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Long enough to be unambiguously past FAST_REJECT_SECONDS as well, so
+       the scenario fails the "fast" test on both discriminators rather than
+       resting on the ring alone. -->
+  <pause milliseconds="2000"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      SIP/2.0 [code] [reason]
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv request="ACK" optional="true" rtd="true" crlf="true"/>
+
+  <timewait milliseconds="1000"/>
+
+  <label id="options_reply"/>
+  <send next="0">
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTagOpt[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <ResponseTimeRepartition value="10, 50, 100, 200, 500, 1000"/>
+
+</scenario>

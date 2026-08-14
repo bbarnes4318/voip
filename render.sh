@@ -145,6 +145,8 @@ BLOCKLIST_CSV="${BLOCKLIST_CSV:-blocklist.csv}"
 [[ "$BLOCKLIST_CSV" = /* ]] || BLOCKLIST_CSV="$HERE/$BLOCKLIST_CSV"
 ENABLE_G729="${ENABLE_G729:-false}"
 DIAL_TIMEOUT="${DIAL_TIMEOUT:-60}"
+MAX_ROUTE_ATTEMPTS="${MAX_ROUTE_ATTEMPTS:-2}"
+FAST_REJECT_SECONDS="${FAST_REJECT_SECONDS:-2}"
 FRACTEL_QUALIFY_FREQ="${FRACTEL_QUALIFY_FREQ:-30}"
 CDR_CSV_PATH="${CDR_CSV_PATH:-/var/log/asterisk/cdr-custom/sbc.csv}"
 LOG_RETAIN_DAYS="${LOG_RETAIN_DAYS:-30}"
@@ -154,6 +156,11 @@ SBC_NAT_LOCAL_NET="${SBC_NAT_LOCAL_NET:-}"
 
 (( RTP_START >= 1024 && RTP_END > RTP_START && RTP_END <= 65535 )) || \
   die "RTP_START/RTP_END out of range ($RTP_START-$RTP_END)"
+
+[[ "$MAX_ROUTE_ATTEMPTS" =~ ^[0-9]+$ ]] && (( MAX_ROUTE_ATTEMPTS >= 1 )) || \
+  die "MAX_ROUTE_ATTEMPTS must be a positive integer, got '$MAX_ROUTE_ATTEMPTS'"
+[[ "$FAST_REJECT_SECONDS" =~ ^[0-9]+$ ]] || \
+  die "FAST_REJECT_SECONDS must be a non-negative integer, got '$FAST_REJECT_SECONDS'"
 
 [[ "$DID_DAILY_CAP" =~ ^[0-9]+$ ]] && (( DID_DAILY_CAP > 0 )) || \
   die "DID_DAILY_CAP must be a positive integer, got '$DID_DAILY_CAP'"
@@ -335,6 +342,33 @@ done
 
 (( FRACTEL_GW_COUNT > 0 )) || die "FRACTEL_PROXY_IPS produced no usable gateways"
 info "FracTEL gateways: $FRACTEL_GW_COUNT ($FRACTEL_IP_LIST)"
+
+# --- effective attempt cap -------------------------------------------------
+# The dialplan gets min(MAX_ROUTE_ATTEMPTS, gateway count), not the raw config
+# value. With one gateway the rotor computes the same index every time, so a
+# cap above 1 would redial the SAME proxy and dial the consumer twice for
+# nothing. Clamping here rather than in the dialplan keeps the dialplan
+# arithmetic free of a second bound to reason about.
+SBC_MAX_ATTEMPTS="$MAX_ROUTE_ATTEMPTS"
+(( SBC_MAX_ATTEMPTS > FRACTEL_GW_COUNT )) && SBC_MAX_ATTEMPTS="$FRACTEL_GW_COUNT"
+info "attempt cap: $SBC_MAX_ATTEMPTS INVITE(s) per call (MAX_ROUTE_ATTEMPTS=$MAX_ROUTE_ATTEMPTS, gateways=$FRACTEL_GW_COUNT)"
+
+# Walking a deep ring is how the INVITE amplification got to 2.48x. Say so
+# rather than letting a large value look deliberate.
+if (( SBC_MAX_ATTEMPTS > 3 )); then
+  cat >&2 <<WARN
+
+  ############################################################
+  #  WARNING: MAX_ROUTE_ATTEMPTS=$SBC_MAX_ATTEMPTS
+  #
+  #  Every gateway here is a proxy on ONE subaccount reaching
+  #  ONE upstream, so a far-end rejection returns identically
+  #  from each of them. A deep ring multiplies the INVITE
+  #  volume the carrier sees without improving connect rate.
+  ############################################################
+
+WARN
+fi
 
 # --- customer endpoints: one endpoint/identify per PK_CLIENT_IPS entry -----
 #
@@ -857,6 +891,12 @@ declare -A R=(
   [NORMALIZE_CALLERID]="$NORMALIZE_CALLERID"
   [DIAL_TIMEOUT]="$DIAL_TIMEOUT"
   [FRACTEL_GW_COUNT]="$FRACTEL_GW_COUNT"
+  [SBC_MAX_ATTEMPTS]="$SBC_MAX_ATTEMPTS"
+  [FAST_REJECT_SECONDS]="$FAST_REJECT_SECONDS"
+  # app_dial exposes DIALEDTIME_MS as well as DIALEDTIME. Comparing in
+  # milliseconds keeps a 1.4s reject on the correct side of a 2s threshold;
+  # whole-second granularity would round it to 1 or 2 depending on nothing.
+  [FAST_REJECT_MS]="$(( FAST_REJECT_SECONDS * 1000 ))"
   [DID_DAILY_CAP]="$DID_DAILY_CAP"
   [TRANSFER_DETECT]="$TRANSFER_DETECT"
   [SBC_TF_NPAS]="$SBC_TF_NPAS"
@@ -978,6 +1018,12 @@ ESSENTIAL_MODULES=(
   func_db.so       # DB()       — the per-DID daily cap counters
   func_lock.so     # TRYLOCK    — the cap's read-modify-write
   func_dialplan.so # DIALPLAN_EXISTS — the high-cost prefix blocklist
+  # HANGUPCAUSE/HANGUPCAUSE_KEYS — the per-attempt SIP response code that lets
+  # a network reject be told apart from a human decline after the fact. An
+  # unregistered FUNCTION only warns and yields empty (unlike an unregistered
+  # APPLICATION, which fails the call outright — see app_exec above), so this
+  # is asserted for the sake of the log and CDR rather than the call path.
+  func_hangupcause.so
   func_cut.so func_logic.so func_strings.so func_channel.so
   func_callerid.so func_global.so func_groupcount.so
 )
