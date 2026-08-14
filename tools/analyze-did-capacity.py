@@ -158,6 +158,11 @@ def analyze(rows, window):
         "spill_hour": defaultdict(dict),
         "refuse_hour": defaultdict(dict),
         "dids_seen": defaultdict(int),
+        # did_daily_peak[did][day] = highest did_daily_count_at_selection seen.
+        # That column includes the call it is on, so its maximum for a day IS
+        # that number's call count for the day -- no need to re-count rows, and
+        # it stays correct even if the CDR is a partial slice.
+        "did_daily_peak": defaultdict(lambda: defaultdict(int)),
         "rows": 0,
         "transfer": 0,
         "pre_reject": 0,
@@ -176,6 +181,12 @@ def analyze(rows, window):
 
         if did:
             st["dids_seen"][did] += 1
+            try:
+                c = int(r[C_DIDCOUNT])
+            except (ValueError, IndexError):
+                c = 0
+            if c > st["did_daily_peak"][did][day]:
+                st["did_daily_peak"][did][day] = c
 
         if reason.startswith(TRANSFER_PREFIX):
             st["transfer"] += 1
@@ -258,6 +269,64 @@ def build_rows(st, pools, caps, headroom):
             rec["buy_%d" % cap] = max(0, n - pool)
         out.append(rec)
     out.sort(key=lambda r: (-r["refused"], -r["peak_daily_demand"]))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Reallocation
+#
+# A DID that already exists moves between pools for free and keeps whatever
+# reputation it has. A purchased one costs money AND arrives unseasoned. So the
+# plan has to say which of the two each number is, per NPA, or a vendor handed
+# the file orders numbers the operator already owns -- and swaps seasoned
+# numbers for fresh ones in the process, which is the opposite of the intent.
+# ---------------------------------------------------------------------------
+EXPERIMENT_NPAS = ("336", "337", "316", "609")
+
+
+def plan_reallocation(recs, ofrec, cap, overflow_min, priority=EXPERIMENT_NPAS):
+    """Match existing surplus DIDs to shortfalls. Never invents a purchase."""
+    donors = []
+    for r in recs:
+        surplus = r["pool_size"] - r["need_%d" % cap]
+        if surplus > 0:
+            donors.append([r["npa"], surplus])
+    # Surplus NPA pools drain first, overflow second. Overflow is the safety
+    # net for every NPA with no pool of its own, so it is the last thing to
+    # take numbers from -- and never below OVERFLOW_MIN.
+    donors.sort(key=lambda d: -d[1])
+    of_surplus = max(0, ofrec["pool_size"] - overflow_min)
+    if of_surplus > 0:
+        donors.append(["OVERFLOW", of_surplus])
+
+    short = [r for r in recs if r["need_%d" % cap] > r["pool_size"]]
+    # The four worst per-DID loads go first, so the reallocation doubles as the
+    # burned-number experiment: if their answer rate moves and nothing else
+    # changed, DID reputation outranks routing.
+    rank = {n: i for i, n in enumerate(priority)}
+    short.sort(key=lambda r: (rank.get(r["npa"], len(rank)),
+                              -(r["need_%d" % cap] - r["pool_size"])))
+
+    out = {}
+    di = 0
+    for r in short:
+        want = r["need_%d" % cap] - r["pool_size"]
+        got, sources = 0, []
+        while want > got and di < len(donors):
+            avail = donors[di][1]
+            if avail <= 0:
+                di += 1
+                continue
+            take = min(avail, want - got)
+            donors[di][1] -= take
+            sources.append((donors[di][0], take))
+            got += take
+        out[r["npa"]] = {
+            "realloc": got,
+            "buy": want - got,
+            "from": sources,
+            "priority": r["npa"] in rank,
+        }
     return out
 
 
@@ -447,23 +516,107 @@ def report(st, pools, recs, ofrec, caps, cur_cap, cost, overflow_min, out=sys.st
     w("  analytics reputation; the lever here is number count, not cap.\n\n")
 
 
-def write_plan(path, recs, ofrec, caps, cost, overflow_min):
+def load_report(st, pools, cap, out=sys.stdout):
+    """Calls per DID per day, and which numbers sit pinned at the cap.
+
+    A number running at the cap every day, dialling into its own area code, is
+    the profile call-analytics engines score on. This is the view that tests
+    whether the worst-answering NPAs are the ones whose two or three numbers
+    are burned -- so it reports per-DID load and consecutive capped days, not
+    just totals.
+    """
+    w = out.write
+    days = sorted(st["days"])
+    w("\n=== load per DID ===\n")
+
+    # --- per NPA ------------------------------------------------------------
+    w("\n--- calls per DID per day, by NPA (worst 25) ---\n")
+    w("  %-6s %5s %10s %12s %10s\n"
+      % ("NPA", "pool", "peak/day", "per DID/day", "vs cap"))
+    rows = []
+    for npa, perday in st["demand"].items():
+        pool = len(pools[npa]) if pools and npa in pools else 0
+        if pool == 0:
+            continue
+        pk = peak(perday)
+        rows.append((pk / float(pool), npa, pool, pk))
+    rows.sort(reverse=True)
+    for per, npa, pool, pk in rows[:25]:
+        w("  %-6s %5d %10d %12.0f %10s\n"
+          % (npa, pool, pk, per, "OVER" if per > cap else ""))
+    if rows:
+        med = sorted(r[0] for r in rows)[len(rows) // 2]
+        w("\n  median %.0f calls/DID/day across %d pooled NPA(s); %d over the %d cap\n"
+          % (med, len(rows), len([r for r in rows if r[0] > cap]), cap))
+
+    # --- per individual DID -------------------------------------------------
+    # did_daily_count_at_selection includes the call it is on, so a row equal
+    # to the cap means that number took its last call of the day.
+    w("\n--- individual DIDs at the cap ---\n")
+    capped_days = defaultdict(set)
+    maxcount = defaultdict(int)
+    for did, peak_by_day in st["did_daily_peak"].items():
+        for day, c in peak_by_day.items():
+            if c >= cap:
+                capped_days[did].add(day)
+            if c > maxcount[did]:
+                maxcount[did] = c
+    for day in days:
+        n = len([d for d in capped_days if day in capped_days[d]])
+        w("  %s  %d DID(s) reached the %d cap\n" % (day, n, cap))
+    if capped_days:
+        w("\n  %-14s %8s %10s %s\n" % ("DID", "peak/day", "days@cap", "which"))
+        for did in sorted(capped_days, key=lambda d: (-len(capped_days[d]), -maxcount[d]))[:20]:
+            w("  %-14s %8d %10d %s\n"
+              % (did, maxcount[did], len(capped_days[did]),
+                 ",".join(sorted(capped_days[did]))))
+        w("\n  %d of %d DID(s) that carried traffic hit the cap on at least one day.\n"
+          % (len(capped_days), len(st["dids_seen"])))
+        w("  Consecutive capped days is the number that matters: a number pinned\n")
+        w("  at the ceiling day after day is the one an analytics engine scores.\n")
+    else:
+        w("  no DID reached the cap in this window\n")
+    w("\n  This is evidence for LOWERING the cap once fleet size allows, not for\n")
+    w("  raising it. A number over the cap is not a number working harder; it is\n")
+    w("  a number more likely to be labelled.\n\n")
+
+
+def write_plan(path, recs, ofrec, caps, cost, overflow_min, cur_cap):
+    # buy_at_cap_* is NET OF REALLOCATION: summing it gives the vendor order and
+    # nothing else. reallocate_at_cap_* is what moves between pools we already
+    # own. The two together equal the shortfall.
+    plans = {c: plan_reallocation(recs, ofrec, c, overflow_min) for c in caps}
     fields = (["npa", "pool_size", "peak_daily_demand", "total_demand",
                "overflow_calls", "refused_calls", "has_dedicated_pool"]
               + ["need_at_cap_%d" % c for c in caps]
-              + ["buy_at_cap_%d" % c for c in caps])
+              + ["reallocate_at_cap_%d" % c for c in caps]
+              + ["buy_at_cap_%d" % c for c in caps]
+              + ["reallocate_from_at_cap_%d" % cur_cap, "provision_order"])
     fh = sys.stdout if path == "-" else open(path, "w", newline="")
     try:
         w = csv.writer(fh)
         w.writerow(fields)
-        for r in recs:
-            if r["total_demand"] == 0 and r["pool_size"] == 0:
-                continue
+        # Experiment NPAs first, then whatever needs the most. The row order IS
+        # the provisioning order: 336/337/316/609 are the four worst per-DID
+        # loads, and doing them before anything else is what makes the
+        # reallocation a test of the burned-number hypothesis.
+        cur = plans[cur_cap]
+        ordered = sorted(
+            (r for r in recs if r["total_demand"] or r["pool_size"]),
+            key=lambda r: (0 if cur.get(r["npa"], {}).get("priority") else 1,
+                           -(cur.get(r["npa"], {}).get("realloc", 0)
+                             + cur.get(r["npa"], {}).get("buy", 0)),
+                           r["npa"]))
+        for i, r in enumerate(ordered, 1):
+            p = cur.get(r["npa"], {})
+            src = "|".join("%s:%d" % (s, n) for s, n in p.get("from", []))
             w.writerow([r["npa"], r["pool_size"], r["peak_daily_demand"],
                         r["total_demand"], r["overflow"], r["refused"],
                         "yes" if r["has_pool"] else "no"]
                        + [r["need_%d" % c] for c in caps]
-                       + [r["buy_%d" % c] for c in caps])
+                       + [plans[c].get(r["npa"], {}).get("realloc", 0) for c in caps]
+                       + [plans[c].get(r["npa"], {}).get("buy", 0) for c in caps]
+                       + [src, i])
         # Overflow is sized to the OVERFLOW_MIN floor, NOT to the spill it is
         # currently absorbing. The per-NPA rows above already buy the numbers
         # that spill consists of; sizing overflow for it as well would order
@@ -472,7 +625,9 @@ def write_plan(path, recs, ofrec, caps, cost, overflow_min):
         w.writerow(["OVERFLOW", ofrec["pool_size"], ofrec["peak_daily_demand"],
                     ofrec["total_demand"], "", "", "yes"]
                    + [overflow_min for _ in caps]
-                   + [max(0, overflow_min - ofrec["pool_size"]) for _ in caps])
+                   + [0 for _ in caps]
+                   + [max(0, overflow_min - ofrec["pool_size"]) for _ in caps]
+                   + ["(donor)", len(ordered) + 1])
     finally:
         if fh is not sys.stdout:
             fh.close()
@@ -489,6 +644,7 @@ def main():
     ap.add_argument("--overflow-min", type=int, default=20)
     ap.add_argument("--headroom", type=float, default=0.0)
     ap.add_argument("--out", default="")
+    ap.add_argument("--load-report", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
@@ -519,9 +675,12 @@ def main():
     ofrec = overflow_record(st, pools, caps, a.headroom)
 
     if not a.quiet:
-        report(st, pools, recs, ofrec, caps, a.cap, a.did_cost, a.overflow_min)
+        if a.load_report:
+            load_report(st, pools, a.cap)
+        else:
+            report(st, pools, recs, ofrec, caps, a.cap, a.did_cost, a.overflow_min)
     if a.out:
-        write_plan(a.out, recs, ofrec, caps, a.did_cost, a.overflow_min)
+        write_plan(a.out, recs, ofrec, caps, a.did_cost, a.overflow_min, a.cap)
         if a.out != "-":
             sys.stderr.write("  purchase plan: %s\n" % a.out)
     return 0
