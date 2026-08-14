@@ -117,7 +117,11 @@ fi
 # ---------------------------------------------------------------------------
 read_stamp() {
   case "$MODE" in
-    remote) ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "cat '$STAMP'" 2>/dev/null ;;
+    # -n is load-bearing: without it ssh reads from stdin, and when this is
+    # called inside the read loop below it swallows the remaining lines. The
+    # check then passes having verified only the first file, which is exactly
+    # the silent pass this whole script exists to prevent.
+    remote) ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "cat '$STAMP'" 2>/dev/null ;;
     *)      cat "$STAMP" 2>/dev/null ;;
   esac
 }
@@ -168,7 +172,10 @@ fi
 # ---------------------------------------------------------------------------
 box_sha() {
   case "$MODE" in
-    remote) ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" \
+    # -n, for the reason in read_stamp: this runs inside the read loop below,
+    # and an ssh without it eats the remaining lines from stdin. The check then
+    # reports OK having verified only the first file.
+    remote) ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" \
               "sha256sum '$SBC_DIR/$1' 2>/dev/null | cut -d' ' -f1" 2>/dev/null ;;
     *)      sha_of "$SBC_DIR/$1" ;;
   esac
