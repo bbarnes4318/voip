@@ -284,21 +284,63 @@ def build_rows(st, pools, caps, headroom):
 EXPERIMENT_NPAS = ("336", "337", "316", "609")
 
 
-def plan_reallocation(recs, ofrec, cap, overflow_min, priority=EXPERIMENT_NPAS):
+def overflow_need(st, recs, plan, ofrec, cap, overflow_min):
+    """How many DIDs overflow must keep to absorb the spill left after `plan`.
+
+    OVERFLOW_MIN is a FLOOR, not overflow's need. Overflow is the only pool that
+    is fungible: one number in it can serve any of the 293 NPAs that have no
+    pool of their own, whereas the same number moved into a dedicated pool can
+    serve exactly one. So its real need is the peak daily spill it still has to
+    carry, and draining below that trades shared capacity for stranded capacity.
+
+    Getting this wrong is not a rounding error. Treating OVERFLOW_MIN as the
+    need made the projected refusals at cap 150 and below WORSE after
+    reallocation than before it -- the reallocation was actively destroying
+    capacity while reporting itself as free.
+    """
+    sizes = {r["npa"]: r["pool_size"] for r in recs}
+    for npa, p in plan.items():
+        sizes[npa] = sizes.get(npa, 0) + p["realloc"]
+    worst = 0
+    for day in st["days"]:
+        spill = 0
+        for npa, perday in st["demand"].items():
+            d = perday.get(day, 0)
+            if d:
+                spill += max(0, d - sizes.get(npa, 0) * cap)
+        worst = max(worst, spill)
+    return max(overflow_min, int(math.ceil(worst / float(cap))))
+
+
+def plan_reallocation(recs, ofrec, cap, overflow_min, priority=EXPERIMENT_NPAS,
+                      st=None):
     """Match existing surplus DIDs to shortfalls. Never invents a purchase."""
     donors = []
     for r in recs:
         surplus = r["pool_size"] - r["need_%d" % cap]
         if surplus > 0:
             donors.append([r["npa"], surplus])
-    # Surplus NPA pools drain first, overflow second. Overflow is the safety
-    # net for every NPA with no pool of its own, so it is the last thing to
-    # take numbers from -- and never below OVERFLOW_MIN.
     donors.sort(key=lambda d: -d[1])
-    of_surplus = max(0, ofrec["pool_size"] - overflow_min)
-    if of_surplus > 0:
-        donors.append(["OVERFLOW", of_surplus])
 
+    # Overflow donates only what it is genuinely NOT using. Computed in two
+    # passes because its need depends on what the NPA-surplus pass leaves
+    # unprovisioned: plan from NPA surplus alone first, measure the residual
+    # spill, and only then decide whether any overflow number is actually idle.
+    # In practice this is usually zero, which is the correct answer -- moving a
+    # number out of a pool serving 293 NPAs into one serving a single NPA is a
+    # downgrade unless that number was doing nothing.
+    if st is not None:
+        first = _match(recs, donors, cap, priority)
+        need = overflow_need(st, recs, first, ofrec, cap, overflow_min)
+        of_surplus = max(0, ofrec["pool_size"] - need)
+        if of_surplus > 0:
+            donors.append(["OVERFLOW", of_surplus])
+
+    return _match(recs, donors, cap, priority)
+
+
+def _match(recs, donors, cap, priority):
+    donors = [list(d) for d in donors]   # never mutate the caller's tallies
     short = [r for r in recs if r["need_%d" % cap] > r["pool_size"]]
     # The four worst per-DID loads go first, so the reallocation doubles as the
     # burned-number experiment: if their answer rate moves and nothing else
@@ -516,6 +558,113 @@ def report(st, pools, recs, ofrec, caps, cur_cap, cost, overflow_min, out=sys.st
     w("  analytics reputation; the lever here is number count, not cap.\n\n")
 
 
+# ---------------------------------------------------------------------------
+# Refusal projection
+#
+# Every refusal in the measured window was produced under a cap of 600, so the
+# fleet had three times the capacity it has under the standing cap of 200.
+# 36,683 refusals is therefore a FLOOR, not a baseline: the same demand against
+# the same fleet at cap 200 refuses far more.
+#
+# Peak-demand arithmetic is unaffected by that -- peak demand is peak demand,
+# and need_at_cap_200 is computed from demand rather than from refusals. What
+# changes is the answer to "does reallocation alone hold, or does the purchase
+# have to land before the trunk comes back up".
+#
+# The model replays each day: a call takes its own NPA pool if that pool has
+# allowance left, else overflow, else it is refused. Daily order does not matter
+# for a DAILY cap -- a pool serves min(demand, pool * cap) that day regardless
+# of when the calls arrive -- so aggregating by day is exact, not an
+# approximation.
+# ---------------------------------------------------------------------------
+
+def simulate_refusals(st, npa_pool, overflow_pool, cap):
+    """-> (total_refused, total_demand, {day: (spill, refused)})"""
+    total_ref = total_dem = 0
+    per_day = {}
+    for day in sorted(st["days"]):
+        spill = dem = 0
+        for npa, perday in st["demand"].items():
+            d = perday.get(day, 0)
+            if not d:
+                continue
+            dem += d
+            spill += max(0, d - npa_pool.get(npa, 0) * cap)
+        refused = max(0, spill - overflow_pool * cap)
+        per_day[day] = (spill, refused)
+        total_ref += refused
+        total_dem += dem
+    return total_ref, total_dem, per_day
+
+
+def post_realloc_pools(recs, ofrec, plan, pools, overflow_min, cap):
+    """Pool sizes after the reallocation plan is applied. No purchases."""
+    sizes = {r["npa"]: r["pool_size"] for r in recs}
+    of = ofrec["pool_size"]
+    for npa, p in plan.items():
+        sizes[npa] = sizes.get(npa, 0) + p["realloc"]
+        for src, n in p["from"]:
+            if src == "OVERFLOW":
+                of -= n
+            else:
+                sizes[src] = sizes.get(src, 0) - n
+    return sizes, max(of, 0)
+
+
+def project_refusals(st, pools, recs, ofrec, caps, overflow_min, out=sys.stdout):
+    w = out.write
+    w("\n=== projected refusals by cap and fleet ===\n")
+    w("\n  Measured refusals came from a window running at cap 600. At 200 the\n")
+    w("  same demand meets a third of the per-pool ceiling, so these are the\n")
+    w("  numbers that decide whether reallocation alone is enough.\n\n")
+    cur_npa = {r["npa"]: r["pool_size"] for r in recs}
+    cur_of = ofrec["pool_size"]
+
+    w("  %6s  %-22s %10s %10s %9s\n"
+      % ("cap", "fleet", "demand", "refused", "% lost"))
+    for cap in caps:
+        plan = plan_reallocation(recs, ofrec, cap, overflow_min, st=st)
+        ra_npa, ra_of = post_realloc_pools(recs, ofrec, plan, pools, overflow_min, cap)
+        # Purchase scenario: every NPA at its own need, overflow back to floor.
+        buy_npa = {r["npa"]: max(r["pool_size"], r["need_%d" % cap]) for r in recs}
+
+        for label, np_, of_ in (
+                ("current fleet", cur_npa, cur_of),
+                ("after reallocation", ra_npa, ra_of),
+                ("after purchase", buy_npa, max(cur_of, overflow_min)),
+        ):
+            ref, dem, _ = simulate_refusals(st, np_, of_, cap)
+            w("  %6s  %-22s %10d %10d %8.1f%%\n"
+              % (cap if label == "current fleet" else "", label, dem, ref,
+                 100.0 * ref / dem if dem else 0.0))
+        w("\n")
+
+    # The decision this exists to answer.
+    plan200 = plan_reallocation(recs, ofrec, 200, overflow_min, st=st)
+    ra_npa, ra_of = post_realloc_pools(recs, ofrec, plan200, pools, overflow_min, 200)
+    ref_cur, dem, _ = simulate_refusals(st, cur_npa, cur_of, 200)
+    ref_ra, _, _ = simulate_refusals(st, ra_npa, ra_of, 200)
+    buy_npa = {r["npa"]: max(r["pool_size"], r["need_200"]) for r in recs}
+    ref_buy, _, _ = simulate_refusals(st, buy_npa, max(cur_of, overflow_min), 200)
+    w("  At cap 200 against this demand:\n")
+    w("    current fleet       %7d refused  (%.1f%%)\n"
+      % (ref_cur, 100.0 * ref_cur / dem if dem else 0))
+    w("    after reallocation  %7d refused  (%.1f%%)   %+d\n"
+      % (ref_ra, 100.0 * ref_ra / dem if dem else 0, ref_ra - ref_cur))
+    w("    after purchase      %7d refused  (%.1f%%)   %+d\n"
+      % (ref_buy, 100.0 * ref_buy / dem if dem else 0, ref_buy - ref_cur))
+    if ref_ra > 0:
+        w("\n    Reallocation alone does NOT clear refusals at cap 200. The\n")
+        w("    purchase has to land before the trunk comes back up, or the\n")
+        w("    box refuses %d call(s) against this demand.\n" % ref_ra)
+    else:
+        w("\n    Reallocation alone clears refusals at cap 200 against this\n")
+        w("    demand. The purchase buys headroom, not recovery.\n")
+    w("\n  Caveat: demand here is OFFERED load from the measured window, which\n")
+    w("  includes the calls that were refused. It does not include demand the\n")
+    w("  dialer suppressed after being refused, so this is still a floor.\n\n")
+
+
 def load_report(st, pools, cap, out=sys.stdout):
     """Calls per DID per day, and which numbers sit pinned at the cap.
 
@@ -581,11 +730,11 @@ def load_report(st, pools, cap, out=sys.stdout):
     w("  a number more likely to be labelled.\n\n")
 
 
-def write_plan(path, recs, ofrec, caps, cost, overflow_min, cur_cap):
+def write_plan(path, recs, ofrec, caps, cost, overflow_min, cur_cap, st):
     # buy_at_cap_* is NET OF REALLOCATION: summing it gives the vendor order and
     # nothing else. reallocate_at_cap_* is what moves between pools we already
     # own. The two together equal the shortfall.
-    plans = {c: plan_reallocation(recs, ofrec, c, overflow_min) for c in caps}
+    plans = {c: plan_reallocation(recs, ofrec, c, overflow_min, st=st) for c in caps}
     fields = (["npa", "pool_size", "peak_daily_demand", "total_demand",
                "overflow_calls", "refused_calls", "has_dedicated_pool"]
               + ["need_at_cap_%d" % c for c in caps]
@@ -645,6 +794,7 @@ def main():
     ap.add_argument("--headroom", type=float, default=0.0)
     ap.add_argument("--out", default="")
     ap.add_argument("--load-report", action="store_true")
+    ap.add_argument("--project-refusals", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
@@ -677,10 +827,12 @@ def main():
     if not a.quiet:
         if a.load_report:
             load_report(st, pools, a.cap)
+        elif a.project_refusals:
+            project_refusals(st, pools, recs, ofrec, caps, a.overflow_min)
         else:
             report(st, pools, recs, ofrec, caps, a.cap, a.did_cost, a.overflow_min)
     if a.out:
-        write_plan(a.out, recs, ofrec, caps, a.did_cost, a.overflow_min, a.cap)
+        write_plan(a.out, recs, ofrec, caps, a.did_cost, a.overflow_min, a.cap, st)
         if a.out != "-":
             sys.stderr.write("  purchase plan: %s\n" % a.out)
     return 0

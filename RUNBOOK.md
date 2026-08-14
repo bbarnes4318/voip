@@ -963,3 +963,50 @@ Retention is `CDR_RETAIN_DAYS` (default 90) for CDR and `SIP_TRACE_KEEP` files
 of `SIP_TRACE_FILE_MB` each (default 20 × 100MB) for traces. If tracebacks
 start arriving, raise both **before** you need them — you cannot retroactively
 retain what you already rotated away.
+
+
+## 9. Evidence: the box was accepting traffic throughout the 2026-08 trunk pause
+
+Recorded because it is what a carrier compliance conversation needs, and
+because the drop-log rule that produced it is easy to remove as "noise" by
+someone who does not know it is the only thing that can prove this.
+
+The customer's traffic stopped after **2026-08-12 20:23 UTC** while compliance
+was proven to the carrier. That is a deliberate pause, not a fault. Established
+read-only on 2026-08-14:
+
+**No customer SIP packet reached the box, and nothing here refused one.**
+
+| Check | Result |
+|---|---|
+| `SBC-DROP-IN` kernel log, 08-13 onward | 32,291 packets logged dropped, **zero from any customer IP** |
+| Sources actually being dropped | SIP scanners: `192.161.49.2` (2,356), `5.61.209.224` (1,128), the `194.180.49.0/24` block |
+| nft `@pk_clients udp dport 5060` accept counter | 0 packets since counters reset at 08-12 20:23 |
+| conntrack flows from customer IPs | none |
+| Asterisk security log | empty — no unidentified requests, so not a changed source IP either |
+| `SBC_KILLSWITCH` | 0, state file `off` |
+| Customer identifies | all three loaded, matching the configured addresses |
+| Carrier gateways | 5/5 `Avail`, RTT 87–144ms — egress healthy throughout |
+| Asterisk | up since 08-12 21:55, `NRestarts=0` |
+
+**The drop log is what makes this provable.** Rule handle 24 in
+`chain inet sbc input` logs at 10/minute before the default drop. Without it,
+"we were accepting and they were not sending" and "we were silently dropping
+them" produce identical evidence: an accept counter at zero. With it, the
+absence of any customer IP in the log is positive proof that no packet from
+them was discarded. Do not remove that rule to quiet the kernel log.
+
+**What this does not prove.** Only that nothing arrived *here*. Blackholing
+upstream of this box — their provider, a route change, their own dialer being
+off — is outside what this box can see. The claim is bounded to: from the SBC
+inward, nothing was refused.
+
+Two facts to state plainly rather than let a reader infer them:
+
+- **The 08-12 window ran with `DID_DAILY_CAP=600`**, set and reverted
+  deliberately. Fleet capacity that day was 296,400 calls rather than the
+  98,800 that cap 200 gives, so the 36,683 `NO_DID_AVAILABLE` refusals measured
+  in that window **understate** what normal operation produces. See
+  `tools/analyze-did-capacity.py --project-refusals`.
+- Traffic on 08-12 tapered out naturally at 19:00, its usual end of window. The
+  21:55 Asterisk restart happened *after* that and interrupted nothing.
