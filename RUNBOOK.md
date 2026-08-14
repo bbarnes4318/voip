@@ -1010,3 +1010,34 @@ Two facts to state plainly rather than let a reader infer them:
   `tools/analyze-did-capacity.py --project-refusals`.
 - Traffic on 08-12 tapered out naturally at 19:00, its usual end of window. The
   21:55 Asterisk restart happened *after* that and interrupted nothing.
+
+### What the reallocation experiment can and cannot prove
+
+Read this before treating a flat result as a settled question.
+
+The reallocation moves existing numbers into 336, 337, 316 and 609 — the four
+worst per-DID loads among the ten NPAs that answered 0% on ShortDuration. It
+reduces **load per number**. It does **not** restore local presence.
+
+The numbers moving into 336 are `1-325-758-xxxx`. Calls to 336 will present a
+325 caller ID. That is still strictly better than what those calls get today —
+a dedicated number at low load beats a shared overflow number pinned at the
+ceiling — but it means the experiment tests one variable and not the other.
+
+| Result | What it means |
+|---|---|
+| 336's ASR **lifts** | Load per number was the problem. The burn hypothesis holds. |
+| 336's ASR **does not move** | **NOT evidence against the hypothesis.** Local presence is still absent and still untested. Only provisioning real 336 numbers tests that, and that is the purchase. |
+
+The incumbents are retired rather than left in the pool for the same reason:
+at 2 dead numbers out of 16, they would have contributed roughly 12% of 336's
+measured ASR permanently, and a blended signal answers neither question. They
+are commented out in `dids.csv` as `#SUPPRESSED` rows, not deleted — if the
+hypothesis holds they are the cleanest evidence that reputation damage is real
+and persistent, and they can be restored by deleting the prefix.
+
+**There is no per-DID suppression in the call path.** `[sbc-did]` walks the pool
+global and checks the daily cap; nothing else. The `S` flag elsewhere in
+`didctl.sh` is transfer-destination state under `sbc/xfer/...` and has no
+bearing on DID selection. Removing a number from the pool is the only thing that
+takes it out of rotation today. Building a real per-DID cooldown is Phase 6.

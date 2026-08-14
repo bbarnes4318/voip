@@ -729,7 +729,7 @@ reallocate)
        plan.csv comes from: python3 tools/analyze-did-capacity.py --out plan.csv"
   shift 2
 
-  RC_CAP="$DID_DAILY_CAP"; RC_APPLY=0; RC_FORCE=0
+  RC_CAP="$DID_DAILY_CAP"; RC_APPLY=0; RC_FORCE=0; RC_SUPPRESS=""
   RC_DIDS="${DIDS_CSV:-$HERE/dids.csv}"
   [[ "$RC_DIDS" = /* ]] || RC_DIDS="$HERE/$RC_DIDS"
   RC_OVERFLOW_MIN="${OVERFLOW_MIN:-20}"
@@ -739,6 +739,7 @@ reallocate)
       --dids)  RC_DIDS="$2"; shift 2 ;;
       --apply) RC_APPLY=1; shift ;;
       --force) RC_FORCE=1; shift ;;
+      --suppress-incumbents) RC_SUPPRESS="$2"; shift 2 ;;
       *) die "reallocate: unknown argument '$1'" ;;
     esac
   done
@@ -807,6 +808,10 @@ reallocate)
     RC_RANKSRC="${Y}stable order — Asterisk unreachable, no usage data${N}"
   fi
 
+  # Retention floor for a donor. Must match donor_retain() in
+  # tools/analyze-did-capacity.py, or the plan asks for moves this refuses.
+  rc_retain() { awk -v n="$1" 'BEGIN{ a=n+2; b=int(n*1.25); if (b<n*1.25) b++; print (a>b)?a:b }'; }
+
   # Sets RC_TAKEN rather than echoing, and is called WITHOUT command
   # substitution. $(rc_take ...) would run it in a subshell, so the RC_POOL
   # update below would be discarded and every donor would keep handing out the
@@ -839,6 +844,37 @@ reallocate)
     RC_BEFORE[$k]="$(wc -w <<< "${RC_POOL[$k]}")"
   done
 
+  # --- incumbents to retire from the experiment NPAs ------------------------
+  #
+  # Snapshotted BEFORE any move, so it is the numbers that were already in
+  # these pools -- the ones that have been running at the ceiling -- and never
+  # a number that just arrived.
+  #
+  # WHY THEY LEAVE THE POOL RATHER THAN GETTING A FLAG.
+  #
+  # The `S` flag elsewhere in this script lives under sbc/xfer/<endpoint>/<dest>
+  # and means "this DESTINATION is not a transfer leg". There is no per-DID
+  # suppression anywhere in the call path: [sbc-did] walks the pool global and
+  # checks the daily cap, and nothing else. Writing an astdb S key against a DID
+  # would therefore be INERT -- the number would keep being selected while the
+  # operator believed it was retired, which is a worse failure than not
+  # suppressing at all.
+  #
+  # So the only thing that actually removes a number from selection today is
+  # taking it out of the pool. They are written back as #SUPPRESSED comment
+  # rows: render.sh skips comments, so they are out of rotation, and they are
+  # still in the file with their NPA, date and reason so they can be restored
+  # and so they remain evidence if the burn hypothesis holds.
+  RC_SUPP_LIST=""
+  if [[ -n "$RC_SUPPRESS" ]]; then
+    for _n in ${RC_SUPPRESS//,/ }; do
+      _n="${_n//[[:space:]]/}"; [[ -n "$_n" ]] || continue
+      for _d in ${RC_POOL[$_n]:-}; do
+        RC_SUPP_LIST+="${RC_SUPP_LIST:+ }$_n:$_d"
+      done
+    done
+  fi
+
   RC_MOVES=0; RC_BLOCKED=0; RC_LINES=""
   # Provision order. 336/337/316/609 are rows 1-4 by construction.
   while IFS=$'\t' read -r npa pool need ra frm ord; do
@@ -851,12 +887,18 @@ reallocate)
       [[ "$cnt" =~ ^[0-9]+$ ]] || die "plan: malformed source '$pair' for NPA $npa"
 
       have="$(wc -w <<< "${RC_POOL[$src]:-}")"
-      # THE GUARD. Re-derived here rather than trusted: the donor's own need at
-      # this cap, or OVERFLOW_MIN for the overflow pool, whichever applies.
+      # THE GUARD. Re-derived here rather than trusted from the planner.
+      #
+      # A donor keeps max(need + 2, ceil(need * 1.25)), NOT need. `need` comes
+      # from the peak of a window whose busiest day was a partial one, so it is
+      # a floor rather than an estimate, and the surplus these pools carried is
+      # what has been absorbing demand variance. Draining every donor onto its
+      # floor would turn the first busier-than-measured day into simultaneous
+      # refusals across every pool that gave numbers away.
       if [[ "$src" == "OVERFLOW" ]]; then
         floor="$RC_OVERFLOW_MIN"
       else
-        floor="${RC_NEED[$src]:-0}"
+        floor="$(rc_retain "${RC_NEED[$src]:-0}")"
       fi
       if (( have - cnt < floor )); then
         RC_LINES+="  ${R}BLOCKED${N}  $src -> $npa  ${cnt} DID(s): would leave $src with $(( have - cnt )), below its own need of ${floor}"$'\n'
@@ -906,6 +948,18 @@ reallocate)
     (( after < RC_NEED[$k] )) && short=$(( short + RC_NEED[$k] - after ))
   done
   echo "          ${short} DID(s) still short after reallocation — that is the purchase"
+
+  if [[ -n "$RC_SUPP_LIST" ]]; then
+    echo
+    echo "  ${B}incumbents to retire${N}  (removed from selection, kept in the file)"
+    for _p in $RC_SUPP_LIST; do
+      _n="${_p%%:*}"; _d="${_p##*:}"
+      _u="${RC_USED[$_d]:-?}"
+      printf '    %-6s %-13s  %s call(s) counted in astdb\n' "$_n" "$_d" "$_u"
+    done
+    echo "    ${D}These are the numbers that ran at the ceiling. Leaving them in${N}"
+    echo "    ${D}would blend dead numbers into the ASR the experiment is reading.${N}"
+  fi
   echo
 
   if (( ! RC_APPLY )); then
@@ -929,8 +983,24 @@ reallocate)
       "$(date '+%F %T')" "$(basename "$PLAN")"
     printf '# %d DID(s) moved between pools. No numbers were purchased.\n' "$RC_MOVES"
     printf '# Previous file: %s\n' "$(basename "$RC_BAK")"
+    if [[ -n "$RC_SUPP_LIST" ]]; then
+      printf '#\n# Retired from selection by didctl.sh reallocate on %s.\n' "$(date '+%F %T')"
+      printf '# These ran at or above the daily cap and are the incumbents of the\n'
+      printf '# experiment NPAs. Commented out, NOT deleted: render.sh skips comment\n'
+      printf '# rows so they are out of rotation, and they stay here as evidence and\n'
+      printf '# for restore. To restore one, delete the SUPPRESSED prefix.\n'
+      for _p in $RC_SUPP_LIST; do
+        printf '#SUPPRESSED,%s,%s,%s,incumbent-at-cap\n' \
+          "${_p%%:*}" "${_p##*:}" "$(date '+%F')"
+      done
+      printf '#\n'
+    fi
     for k in $(printf '%s\n' "${!RC_POOL[@]}" | grep -v OVERFLOW | sort); do
-      for d in ${RC_POOL[$k]}; do printf '%s,%s\n' "$k" "$d"; done
+      for d in ${RC_POOL[$k]}; do
+        _skip=0
+        for _p in $RC_SUPP_LIST; do [[ "$_p" == "$k:$d" ]] && _skip=1; done
+        (( _skip )) || printf '%s,%s\n' "$k" "$d"
+      done
     done
     for d in ${RC_POOL[OVERFLOW]:-}; do printf 'OVERFLOW,%s\n' "$d"; done
   } > "$RC_DIDS.new" || die "could not write $RC_DIDS.new"

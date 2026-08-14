@@ -284,6 +284,22 @@ def build_rows(st, pools, caps, headroom):
 EXPERIMENT_NPAS = ("336", "337", "316", "609")
 
 
+def donor_retain(need):
+    """What a donor keeps: max(need + 2, ceil(need * 1.25)).
+
+    A donor must NOT be drained to exactly its need. `need` is derived from the
+    peak of a three-day window whose highest-volume day (2026-08-10) was a
+    PARTIAL day starting 13:23 -- so it is a floor, not an estimate. The surplus
+    those pools were carrying is what has been absorbing demand variance.
+    Draining every donor onto its floor turns the first busier-than-measured day
+    into simultaneous refusals across every pool that gave numbers away.
+
+    Both terms matter: +2 protects small pools, where 25% of 1 rounds to nothing,
+    and 1.25x protects large ones, where +2 is noise.
+    """
+    return max(need + 2, int(math.ceil(need * 1.25)))
+
+
 def overflow_need(st, recs, plan, ofrec, cap, overflow_min):
     """How many DIDs overflow must keep to absorb the spill left after `plan`.
 
@@ -317,7 +333,7 @@ def plan_reallocation(recs, ofrec, cap, overflow_min, priority=EXPERIMENT_NPAS,
     """Match existing surplus DIDs to shortfalls. Never invents a purchase."""
     donors = []
     for r in recs:
-        surplus = r["pool_size"] - r["need_%d" % cap]
+        surplus = r["pool_size"] - donor_retain(r["need_%d" % cap])
         if surplus > 0:
             donors.append([r["npa"], surplus])
     donors.sort(key=lambda d: -d[1])
