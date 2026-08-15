@@ -74,3 +74,9 @@ __pycache__/
 # FracTEL order-run state: contains purchased DIDs, not secrets, but
 # it is site-specific and belongs on the box that ran the order.
 fractel-order-state.json
+
+# Carrier CDR exports. 25MB of third-party call records (240k numbers
+# belonging to other FracTEL customers) -- never belongs in this repo, and an
+# untracked file here also makes verify-deployment.sh --write stamp the box
+# "WORKING TREE DIRTY".
+fractel-*.csv
