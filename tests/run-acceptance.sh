@@ -1151,6 +1151,74 @@ else
 fi
 
 # ===========================================================================
+# Criterion 28 — media actually arrives
+#
+# Criterion 10 proves RTP does not flow DIRECTLY between customer and carrier.
+# It cannot prove RTP arrives at all: it inspects a local capture against a
+# SIPp stub with -rtp_echo, which answers from the same address it signals
+# from. Every real carrier that does not anchor media does not.
+#
+# This criterion exists because that gap was live on the production box from
+# the day it was built until 2026-08-15. The RTP rules filtered by source
+# address, FracTEL advertises SDP c= on terminating-endpoint networks that are
+# in no set, and so:
+#
+#   ip saddr @pk_clients udp dport 10000-20000  packets 0 bytes 0 accept
+#   ip saddr @fractel    udp dport 10000-20000  packets 0 bytes 0 accept
+#   counter drop                          packets 2596473 bytes 499006197 drop
+#
+# Zero accepted, lifetime, against 2.6 million dropped. SIP was flawless
+# throughout -- it rides conntrack -- so every dashboard showed calls
+# answering while the customer heard dead air and hung up at two seconds.
+#
+# The assertion is deliberately blunt: if calls are answering and the RTP
+# accept rule has passed nothing, the media path is broken. That is the exact
+# condition that was true for the entire life of this box.
+# ===========================================================================
+echo
+if ! command -v nft >/dev/null; then
+  skip "crit 28" "nft not installed — cannot read the RTP accept counter"
+elif [[ "$(id -u)" != "0" ]]; then
+  skip "crit 28" "not root — cannot read nftables counters"
+else
+  RTP_LO="$(sed -n 's/^rtpstart=\([0-9]*\).*/\1/p' /etc/asterisk/rtp.conf 2>/dev/null | head -1)"
+  RTP_HI="$(sed -n 's/^rtpend=\([0-9]*\).*/\1/p'   /etc/asterisk/rtp.conf 2>/dev/null | head -1)"
+  RTP_LO="${RTP_LO:-10000}"; RTP_HI="${RTP_HI:-20000}"
+
+  # Sum every accept rule covering the media range, however it is scoped.
+  RTP_PKTS="$(nft -a list ruleset 2>/dev/null \
+    | grep -F "udp dport ${RTP_LO}-${RTP_HI}" | grep -F 'accept' \
+    | sed -n 's/.*counter packets \([0-9]*\).*/\1/p' \
+    | awk '{s+=$1} END{print s+0}')"
+
+  # Has anything actually answered? Asterisk's own counter, which survives
+  # whatever the CDR is or is not writing.
+  ANSWERED="$(asterisk -rx 'core show channels' 2>/dev/null \
+              | sed -n 's/^\([0-9]\{1,\}\) calls processed.*/\1/p' | head -1)"
+  ANSWERED="${ANSWERED:-0}"
+
+  # Asterisk's view, as a second opinion on the firewall counter.
+  RX_CH="$(asterisk -rx 'pjsip show channelstats' 2>/dev/null \
+           | awk 'NF==12 && $2 ~ /^[0-9][0-9]:/ && $4>0 {n++} END{print n+0}')"
+
+  if [[ "$ANSWERED" -eq 0 ]]; then
+    skip "crit 28" "no calls processed yet — nothing to assert media against"
+  elif [[ "$RTP_PKTS" -eq 0 ]]; then
+    fail "crit 28" "$ANSWERED call(s) processed and the RTP accept rule has passed 0 packets"
+    note "media is not reaching Asterisk: every RTP packet is being dropped before it arrives"
+    note "check whether the RTP rules filter by source address — carriers that do not"
+    note "anchor media send from the terminating endpoint's network, which is in no set"
+    note "  nft -a list ruleset | grep -E 'dport ${RTP_LO}-${RTP_HI}|counter.*drop'"
+  else
+    pass "crit 28" "RTP accept rule has passed $RTP_PKTS packet(s) across $ANSWERED processed call(s)"
+    note "channels currently receiving RTP: $RX_CH"
+    if [[ "$RX_CH" -eq 0 ]]; then
+      note "${YEL}no live channel is receiving RTP right now — fine if idle, not if calls are up${NC}"
+    fi
+  fi
+fi
+
+# ===========================================================================
 echo "==========================================================================="
 printf '  %s%d passed%s, %s%d failed%s, %s%d skipped%s\n' \
   "$GREEN" "$PASS" "$NC" "$RED" "$FAIL" "$NC" "$YEL" "$SKIP" "$NC"
