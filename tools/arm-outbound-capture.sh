@@ -77,8 +77,12 @@ echo
 if [[ "$MODE" == "arm" ]]; then
   say "armed -- waiting for a live channel (nothing is being captured yet)"
   while :; do
+    # "channel" not "channels": Asterisk prints "1 active channel" in the
+    # singular, so a pattern anchored on the plural never matches a single
+    # call and the capture sits armed straight through it. That is exactly
+    # what happened on the first originate test.
     n="$(asterisk -rx 'core show channels' 2>/dev/null \
-         | sed -n 's/^\([0-9]\{1,\}\) active channels.*/\1/p' | head -1)"
+         | sed -n 's/^\([0-9]\{1,\}\) active channels\{0,1\}.*/\1/p' | head -1)"
     [[ "${n:-0}" -gt 0 ]] && { say "${G}traffic detected (${n} channels)${N}"; break; }
     sleep 2
   done
