@@ -466,20 +466,40 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  ; stale data from the previous gateway.
  same => n,Set(RINGTIME_MS=)
  same => n,Set(DIALEDTIME_MS=)
- ; No Dial() options at all. No t/T (no transfer), no g/G, no M/L. The only
- ; thing this leg can do is connect two RTP streams through this box.
- same => n,Dial(PJSIP/${SBC_DEST}@${SBC_GW},${SBC_DIAL_TIMEOUT})
+ ; Our own attempt clock, because app_dial's is not usable here: DIALEDTIME_MS
+ ; is populated only when the call is ANSWERED, so on every failure path it
+ ; stays empty and SBC_DIAL_MS below read as zero. That silently disabled the
+ ; fast-reject test at (declined) for the entire life of this dialplan --
+ ; measured on this box, all 1,808 logged attempts carry dialed_ms=0.
+ ; STRFTIME(,,%s%3q) is epoch milliseconds and is set on every path.
+ same => n,Set(SBC_T0_MS=${STRFTIME(,,%s%3q)})
+ ; The g option is what makes SBC-ATTEMPT observable on an answered call.
+ ; Without it app_dial hangs the caller up the instant the callee does, none
+ ; of the dialplan below runs, and every ANSWER is absent from the log --
+ ; 1,808 attempts recorded against 2,182 real answers, so the Phase 2
+ ; retroactive analysis could only ever see calls that failed.
+ ;
+ ; g changes logging, not routing: ANSWER is not CHANUNAVAIL, so it takes the
+ ; same Goto(finish) it always did, two priorities later. Still no t/T (no
+ ; transfer), no G, no M/L -- this leg connects two RTP streams and nothing
+ ; else.
+ same => n,Dial(PJSIP/${SBC_DEST}@${SBC_GW},${SBC_DIAL_TIMEOUT},g)
  same => n,Set(SBC_DS=${DIALSTATUS})
  ; Read immediately after Dial() returns, while HANGUPCAUSE still holds the
  ; cause from the channel just dialled. By the time the h extension runs it
  ; has been overwritten by this dialplan's own Hangup().
  same => n,Set(SBC_CAUSE=${HANGUPCAUSE})
  same => n,Set(SBC_RING_MS=${IF($["${RINGTIME_MS}" != ""]?${RINGTIME_MS}:0)})
- same => n,Set(SBC_DIAL_MS=${IF($["${DIALEDTIME_MS}" != ""]?${DIALEDTIME_MS}:0)})
+ ; Measured, not reported: INVITE -> Dial() return, on every outcome. This is
+ ; the value the fast-reject test at (declined) needs and never had.
+ same => n,Set(SBC_DIAL_MS=$[${STRFTIME(,,%s%3q)} - ${SBC_T0_MS}])
+ ; app_dial's own figure, kept alongside so the two can be compared on
+ ; answered calls now that g makes them observable. Zero on failure paths.
+ same => n,Set(SBC_ANSWERED_MS=${IF($["${DIALEDTIME_MS}" != ""]?${DIALEDTIME_MS}:0)})
  ; One line per INVITE. This is what lets Phase 2 separate a network reject
  ; from a human decline retroactively: cause=21 with ring_ms>0 is a person
  ; declining, cause=21 with ring_ms=0 in under a second is the trunk.
- same => n,Log(NOTICE,SBC-ATTEMPT callid=${SBC_CALLID} ep=${SBC_EP} dst=${SBC_DEST} gw=${SBC_GW} attempt=${SBC_TRY} status=${SBC_DS} cause=${SBC_CAUSE} ring_ms=${SBC_RING_MS} dialed_ms=${SBC_DIAL_MS})
+ same => n,Log(NOTICE,SBC-ATTEMPT callid=${SBC_CALLID} ep=${SBC_EP} dst=${SBC_DEST} gw=${SBC_GW} attempt=${SBC_TRY} status=${SBC_DS} cause=${SBC_CAUSE} ring_ms=${SBC_RING_MS} dialed_ms=${SBC_DIAL_MS} answered_ms=${SBC_ANSWERED_MS} billsec=${CDR(billsec)})
 
  ; ---- failover classification --------------------------------------------
  ; CONGESTION is a trunk-level failure — 503, and the transport-level failures
@@ -513,6 +533,26 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  ; Never rang, but took long enough that this is not a fast trunk-level
  ; refusal either. Ambiguous, so take the side that does not dial a consumer
  ; twice.
+ ;
+ ; SBC_FAST_REJECT_MS=0 disables this test, and 0 is the default. That is
+ ; deliberate and it is NOT a no-op change: until SBC_DIAL_MS was measured
+ ; above, it was always 0, this test could never fire, and every ambiguous
+ ; CHANUNAVAIL fell through to (gwnext). Populating the clock would silently
+ ; switch the branch on and start suppressing retries that production has
+ ; been taking all along.
+ ;
+ ; Suppressing them is expensive. Reconciled against the carrier's own CDR for
+ ; 2026-08-14, 1,153 of 3,145 calls retried and 434 of those retries ANSWERED
+ ; -- 13.8% of all completed calls. Of first attempts that failed 603, 44.5%
+ ; answered on the second gateway, which directly contradicts the "one
+ ; subaccount behind every proxy, so the rejection comes back identically"
+ ; reasoning above. Turn this on only after re-measuring that, on the lab box,
+ ; against acceptance criteria 24-26.
+ ; Two tests rather than one with '&': & is the channel separator in Dial()
+ ; and its precedence inside $[ ] is not something to take on trust in the
+ ; path that decides whether a consumer gets dialled twice. Disabled-check
+ ; first, so the zero default short-circuits to exactly today's behaviour.
+ same => n,GotoIf($[${SBC_FAST_REJECT_MS} <= 0]?gwnext)
  same => n,GotoIf($[${SBC_DIAL_MS} >= ${SBC_FAST_REJECT_MS}]?declined)
  same => n,Goto(gwnext)
 
@@ -597,7 +637,13 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
 ; --- teardown --------------------------------------------------------------
 ; cdr.conf sets endbeforehexten=no, so CDR() assignments made here still land
 ; in the written row. This is where hangup_cause gets recorded.
-exten => h,1,Set(CDR(hangup_cause)=${HANGUPCAUSE})
+; SBC_CAUSE was captured the instant Dial() returned, while HANGUPCAUSE still
+; held the dialled channel's cause. Prefer it: with the g option on Dial(),
+; answered calls now reach (finish) and are torn down by this dialplan's own
+; Hangup(), which overwrites HANGUPCAUSE before h runs. Calls that never got
+; as far as Dial() -- every rejection path -- leave SBC_CAUSE empty and fall
+; back to HANGUPCAUSE, which is what Hangup(21)/Hangup(34) just set.
+exten => h,1,Set(CDR(hangup_cause)=${IF($["${SBC_CAUSE}" != ""]?${SBC_CAUSE}:${HANGUPCAUSE})})
  same => n,NoOp(SBC-END callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} dst=${SBC_DEST} did=${SBC_DID} xfer=${SBC_XFER} disp=${CDR(disposition)} billsec=${CDR(billsec)} gw=${CDR(fractel_gateway_used)} reject=${CDR(reject_reason)})
 
  ; --- transfer-leg learning ------------------------------------------------

@@ -146,7 +146,15 @@ BLOCKLIST_CSV="${BLOCKLIST_CSV:-blocklist.csv}"
 ENABLE_G729="${ENABLE_G729:-false}"
 DIAL_TIMEOUT="${DIAL_TIMEOUT:-60}"
 MAX_ROUTE_ATTEMPTS="${MAX_ROUTE_ATTEMPTS:-2}"
-FAST_REJECT_SECONDS="${FAST_REJECT_SECONDS:-2}"
+# 0 = the fast-reject retry suppression is OFF, and that is the default on
+# purpose. It was nominally 2 seconds, but the dialplan compared it against a
+# SBC_DIAL_MS that app_dial never populated on a failure path, so the branch
+# has never once fired in production. Now that the dialplan measures its own
+# attempt clock the comparison would suddenly start working, which is a
+# routing change disguised as a telemetry fix. Carrier-reconciled figures for
+# 2026-08-14: retries answered 434 calls, 13.8% of everything completed.
+# Raise this only on the lab box, under acceptance criteria 24-26.
+FAST_REJECT_SECONDS="${FAST_REJECT_SECONDS:-0}"
 FRACTEL_QUALIFY_FREQ="${FRACTEL_QUALIFY_FREQ:-30}"
 CDR_CSV_PATH="${CDR_CSV_PATH:-/var/log/asterisk/cdr-custom/sbc.csv}"
 LOG_RETAIN_DAYS="${LOG_RETAIN_DAYS:-30}"
