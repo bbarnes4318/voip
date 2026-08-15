@@ -55,7 +55,56 @@ WRITE_SHA=""
 
 # The files that are actually deployed by hand. Adding one here without adding
 # it to the deploy is how this check starts lying, so keep the two together.
-TRACKED=(render.sh asterisk/extensions.conf.tpl didctl.sh)
+#
+# This list was three files -- render.sh, extensions.conf.tpl, didctl.sh --
+# until 2026-08-15, and the other seventeen were unaccounted for. firewall.sh
+# was one of them. It is the file that decides whether media reaches Asterisk
+# at all, it had a rule that dropped 2.6 million RTP packets and every call
+# with them, and the stamp had nothing to say about which version was running.
+#
+# So this is now the audited set, not the remembered set: every repo file that
+# is present on the box AND either runs there or renders into /etc/asterisk.
+# Derived by hashing all 116 files under /opt/sbc against the repo, not by
+# recollection. If you add a file to the deploy, add it here in the same
+# change -- and if you cannot say whether it belongs, that is the signal that
+# the deploy has drifted again.
+#
+# Deliberately NOT tracked, so the absences are decisions rather than gaps:
+#   tests/**                 33 files, on the box but never in a call path.
+#                            Tracking them makes every test edit read as
+#                            production drift.
+#   lib/routes.sh            in the repo, NOT on the box, wired into nothing.
+#                            Phase 1. Its own header claims render.sh and
+#                            firewall.sh source it; neither does.
+#   tools/analyze-did-capacity.py   workstation tool, never deployed.
+#   *.example, *.md, .git*   documentation and samples.
+#   config.env, dids.csv, blocklist.csv   per-box state, not repo content.
+TRACKED=(
+  # render.sh's inputs: everything that becomes /etc/asterisk
+  asterisk/cdr.conf.tpl
+  asterisk/cdr_custom.conf.tpl
+  asterisk/extensions.conf.tpl
+  asterisk/http.conf.tpl
+  asterisk/logger.conf.tpl
+  asterisk/manager.conf.tpl
+  asterisk/modules.conf.tpl
+  asterisk/pjsip.conf.tpl
+  asterisk/rtp.conf.tpl
+  # scripts that run on the box
+  render.sh
+  didctl.sh
+  firewall.sh
+  healthcheck.sh
+  install.sh
+  killswitch.sh
+  monitor.sh
+  verify-deployment.sh
+  # sourced by the above
+  lib/pk-clients.sh
+  # tools invoked on the box
+  tools/build-blocklist.py
+  tools/fractel-order.py
+)
 
 # The files Asterisk actually reads. TRACKED covers the INPUTS to render.sh --
 # hashing only those leaves the outputs unverified, and the outputs are what
