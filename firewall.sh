@@ -148,7 +148,15 @@ MEDIA_EXTRA_EL="$(to_elements "$PK_CLIENT_MEDIA_EXTRA")"
 info "admin   : $ADMIN_EL"
 info "customer: $PK_EL"
 info "fractel : $FT_EL"
-[[ -n "$MEDIA_EXTRA_EL" ]] && info "extra RTP: $MEDIA_EXTRA_EL"
+# PK_CLIENT_MEDIA_EXTRA no longer gates anything: the RTP rule accepts the
+# media range from any source, for the reasons set out at that rule. Say so
+# rather than printing it as though it were still in force -- a config knob
+# that silently stopped mattering is worse than one that was never there.
+if [[ -n "$MEDIA_EXTRA_EL" ]]; then
+  info "extra RTP: $MEDIA_EXTRA_EL"
+  info "  (informational only -- RTP is no longer source-filtered; the"
+  info "   pk_media set is still built but no rule reads it)"
+fi
 
 # --- lockout check --------------------------------------------------------
 # $SSH_CONNECTION is "<client ip> <client port> <server ip> <server port>".
@@ -264,10 +272,58 @@ $( [[ -n "$BLOCKED_EL" ]] && echo "        elements = { $BLOCKED_EL }" )
         ip saddr @fractel    udp dport $SIP_PORT counter accept
         ip saddr @fractel    tcp dport $SIP_PORT counter accept
 
-        # --- RTP: the same addresses, media range only ---
-        ip saddr @pk_clients udp dport $RTP_START-$RTP_END counter accept
-        ip saddr @pk_media   udp dport $RTP_START-$RTP_END counter accept
-        ip saddr @fractel    udp dport $RTP_START-$RTP_END counter accept
+        # --- RTP: media range, ANY source. Read this before narrowing it. ---
+        #
+        # This rule used to filter RTP by source address, the same way SIP
+        # does above: @pk_clients, @pk_media and @fractel. That configuration
+        # dropped every media packet this box ever received.
+        #
+        # The evidence, measured on 2026-08-15 with live traffic:
+        #
+        #   ip saddr @pk_clients udp dport 10000-20000  packets 0 bytes 0
+        #   ip saddr @fractel    udp dport 10000-20000  packets 0 bytes 0
+        #   counter drop                          packets 2596473 bytes 499006197
+        #
+        # Zero packets, lifetime, on both accept rules, against 2.6 million
+        # dropped and still climbing at ~800/s. tcpdump saw 9,483 inbound
+        # ulaw packets (length 172) in ten seconds; Asterisk had 22 live
+        # channels and not one with rx>0. The media reached the NIC and
+        # netfilter discarded all of it.
+        #
+        # The cause is that FracTEL does not anchor media. Their 200 OK
+        # signals from an @fractel proxy but advertises SDP c= on a different
+        # network entirely:
+        #
+        #   signalling 14.1.29.149    ->  c=IN IP4 208.192.176.173
+        #   signalling 137.220.61.54  ->  c=IN IP4 174.210.70.252
+        #   signalling 74.201.72.61   ->  c=IN IP4 162.212.244.1
+        #
+        # 208.192.176.173 and 174.210.70.252 are consumer ISP endpoints, not
+        # carrier infrastructure. RTP arrives from whatever network the
+        # TERMINATING party sits on, which is unbounded and changes per call.
+        # There is no "FracTEL media range" to allowlist, so source filtering
+        # here cannot be made correct by widening the set -- it can only be
+        # made to fail less often.
+        #
+        # SIP is unaffected and stays source-filtered: it is the only thing
+        # that can reach the dialplan, and it still rides conntrack for
+        # responses. What this opens is the media port range and nothing else.
+        #
+        # The compensating control is in rtp.conf, not here: strictrtp=yes
+        # with probation=4. Asterisk binds each RTP session to the source it
+        # learns during probation and discards anything that does not match,
+        # so an unrelated sender cannot inject audio into a call. That is the
+        # right layer for a per-session check; a firewall set cannot do it
+        # because it has no idea which sessions exist.
+        #
+        # Before narrowing this again, confirm with FracTEL that they anchor
+        # media for this trunk AND get their ranges in writing. Until then,
+        # narrowing it takes the audio away.
+        #
+        # The counter stays so media volume is visible: this rule sitting at
+        # 0 packets while calls are answering is the exact failure above, and
+        # the acceptance suite asserts against it.
+        udp dport $RTP_START-$RTP_END counter accept
 
         # Nothing else. Note what is NOT here: AMI (5038), ARI/HTTP (8088),
         # and every other port on the box. There is no rule that could expose
