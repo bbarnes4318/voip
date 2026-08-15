@@ -2,6 +2,13 @@
 # what OS the repo was cloned or edited on. A CRLF in install.sh produces
 # "bad interpreter: /usr/bin/env bash^M" on test day.
 *.sh    text eol=lf
+# *.py belongs here for the same reason. The tools under tools/ are executable
+# and are invoked on the box (render.sh and install.sh both shell out to
+# build-blocklist.py), so a CRLF shebang is the same "bad interpreter: ^M" on
+# any direct run. Without this rule the working tree had already drifted:
+# build-blocklist.py and fractel-order.py were CRLF locally while the index
+# held LF, and the box is deployed by scp straight out of that working tree.
+*.py    text eol=lf
 *.tpl   text eol=lf
 *.conf  text eol=lf
 *.env   text eol=lf
