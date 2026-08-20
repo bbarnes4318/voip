@@ -134,6 +134,13 @@ VALIDATE_CALLERID="${VALIDATE_CALLERID:-false}"
 NORMALIZE_CALLERID="${NORMALIZE_CALLERID:-false}"
 DID_DAILY_CAP="${DID_DAILY_CAP:-200}"
 OVERFLOW_MIN="${OVERFLOW_MIN:-20}"
+# Largest a single SBC_DID_POOL_* value may be. Not a preference: Asterisk
+# expands a Gosub argument into a 4096-byte buffer, so 4095 characters are
+# usable and character 4096 onward is discarded mid-value. Measured on
+# Asterisk 20.6 in production on 2026-08-20. Raising this does not raise the
+# buffer; it only re-enables the silent truncation. See the check below and
+# RUNBOOK.md, 'DID pool size ceilings'.
+DID_POOL_ARG_MAX="${DID_POOL_ARG_MAX:-4096}"
 TRANSFER_DETECT="${TRANSFER_DETECT:-true}"
 TRANSFER_TOLLFREE_NPAS="${TRANSFER_TOLLFREE_NPAS:-800,833,844,855,866,877,888}"
 TRANSFER_MIN_CALLS="${TRANSFER_MIN_CALLS:-3}"
@@ -621,6 +628,53 @@ DID_NPA_POOLS=0
 for _k in "${!DID_POOL[@]}"; do
   _list="${DID_POOL[$_k]}"
   _cnt="$(awk -F'|' '{print NF}' <<< "$_list")"
+
+  # A pool global has to survive being PASSED, not just being stored. The
+  # dialplan does
+  #     Gosub(sbc-did,pick,1(<key>,${GLOBAL(SBC_DID_POOL_<key>)},<count>))
+  # and Asterisk expands that argument into a 4096-byte buffer. Past 4095
+  # usable characters the value is cut mid-string and NOTHING reports it: the
+  # config file is correct, `dialplan show globals` reads back byte-exact,
+  # and only the running call path is wrong.
+  #
+  # 2026-08-20, in production, with a 500-member OVERFLOW pool (5999 bytes):
+  # the cut landed at 4095, leaving 341 whole members, a 342nd truncated to
+  # the fragment "173", and members 343-500 unreachable. SBC_DID_CNT_OVERFLOW
+  # still said 500, so the ring walked onto indices that CUT() resolved to a
+  # fragment or to nothing. That produced 200 NO_DID_AVAILABLE rejects, 17
+  # BAD_SELECTED_DID rejects, an astdb counter keyed on the empty string,
+  # lock contention on did_ (empty), and a 3.7x selection pile-up on indices
+  # 1-50 as every overrun walked forward to the head of the ring.
+  #
+  # Refuse to render it. A pool that cannot be passed is worse than a pool
+  # that is too small: too small merely caps throughput, whereas this asserts
+  # a malformed caller ID and silently strands most of the numbers.
+  if (( ${#_list} > DID_POOL_ARG_MAX )); then
+    _fit="$(awk -F'|' -v lim="$DID_POOL_ARG_MAX" '
+      { n=0; len=0
+        for (i = 1; i <= NF; i++) {
+          add = length($i) + (i > 1 ? 1 : 0)
+          if (len + add > lim) break
+          len += add; n++
+        }
+        print n }' <<< "$_list")"
+    die "pool SBC_DID_POOL_$_k is ${#_list} bytes ($_cnt numbers).
+
+       The dialplan passes it as a Gosub argument, which Asterisk truncates
+       at $DID_POOL_ARG_MAX bytes. Only $_fit of the $_cnt numbers would be
+       reachable; the next one would be cut mid-number and asserted as a
+       malformed caller ID, and the rest would resolve to an empty string.
+       SBC_DID_CNT_$_k would still claim $_cnt, so the dialplan would keep
+       selecting indices that cannot resolve.
+
+       This is a HARD limit of the call path, not of the config file: the
+       global itself loads fine and reads back byte-exact, which is why
+       this has to be caught here rather than at deploy time.
+
+       Reduce pool $_k to at most $_fit numbers in $DIDS_CSV.
+       See RUNBOOK.md, 'DID pool size ceilings'."
+  fi
+
   printf 'SBC_DID_POOL_%s=%s\n' "$_k" "$_list" >> "$BLOCK_DIR/did_globals"
   printf 'SBC_DID_CNT_%s=%s\n'  "$_k" "$_cnt"  >> "$BLOCK_DIR/did_globals"
   [[ "$_k" != "OVERFLOW" ]] && DID_NPA_POOLS=$((DID_NPA_POOLS + 1))

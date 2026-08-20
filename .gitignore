@@ -80,3 +80,9 @@ fractel-order-state.json
 # untracked file here also makes verify-deployment.sh --write stamp the box
 # "WORKING TREE DIRTY".
 fractel-*.csv
+# Same thing, different naming convention: the "(direct)" day-range exports.
+# Note the glob is Aug*(direct).csv, not Aug_*(direct).csv -- the latter misses
+# "August_11_to_August_12(direct).csv", and a single missed file is enough to
+# put "(WORKING TREE DIRTY AT WRITE TIME)" inside the commit= value of
+# DEPLOYED_COMMIT, which verify-deployment.sh then cannot resolve.
+Aug*(direct).csv

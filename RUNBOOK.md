@@ -393,6 +393,81 @@ restart, so the box keeps asserting numbers you may no longer own. It detects
 this and exits 2 with the orphaned NPAs listed — clearing them needs a drain
 and restart.
 
+### DID pool size ceilings
+
+There are **three** different limits on how big a `SBC_DID_POOL_*` value can
+be, they apply at three different moments, and clearing one tells you nothing
+about the next. All three were measured on this box, on Asterisk 20.6.
+
+| # | Ceiling | Applies when | Failure mode |
+|---|---|---|---|
+| 1 | **~490 bytes** of total command | `didctl.sh sync-globals` sets it at runtime | CLI returns success, global keeps its **old** value |
+| 2 | **4095 usable bytes** of the value | **every call**, passing the pool as a `Gosub` argument | value cut **mid-number**; tail unreachable |
+| 3 | **≥5999 bytes** — no ceiling found | `systemctl restart`, reading `[globals]` from the file | none observed |
+
+The trap is that they run in that order of severity but the **opposite** order
+of visibility. Ceiling 3 is the one everybody tests, and it is the one that
+does not bite. Ceiling 2 is invisible to every check that inspects state
+rather than behaviour.
+
+**Ceiling 2 is the dangerous one.** `[sbc-did]` is called as
+
+```
+Gosub(sbc-did,pick,1(<key>,${GLOBAL(SBC_DID_POOL_<key>)},<count>))
+```
+
+and Asterisk expands that argument into a 4096-byte buffer — 4095 usable
+characters, then it stops. At ~12 bytes per DID that is **341 numbers**.
+
+Everything you would normally check still looks correct: `dids.csv` is right,
+the rendered `extensions.conf` is right, and `dialplan show globals` reads the
+value back **byte-for-byte identical to the file**, because the global really
+did load. Only `SBC_P_LIST` inside the subroutine is short, and nothing prints
+it.
+
+Because `SBC_DID_CNT_<key>` is a short global that always applies cleanly, the
+ring keeps walking indices the list can no longer resolve:
+
+* index ≤ 341 — a whole number, works;
+* index 342 — the number **cut mid-string**. `CUT()` returns a fragment such
+  as `173`, which is non-empty, so `pick` accepts it, counts it against a
+  bogus astdb key, and hands it to the caller-ID guard, which rejects the call
+  `BAD_SELECTED_DID`;
+* index ≥ 343 — empty. `pick` returns no DID, the call falls to overflow, and
+  if overflow is the pool that truncated, the call is rejected
+  `NO_DID_AVAILABLE`.
+
+Every overrun then walks *forward* to the head of the ring, so the first ~50
+numbers absorb several times their share and cap out early while most of the
+pool sits idle.
+
+Measured in production on 2026-08-20 with a 500-member OVERFLOW pool (5999
+bytes), inside one traffic day: 200 `NO_DID_AVAILABLE`, 17
+`BAD_SELECTED_DID`, an astdb counter keyed on the **empty string**, lock
+contention on `did_` (empty), and a 3.7× selection pile-up on indices 1–50.
+The `NO_DID_AVAILABLE` burst stopped on its own after exactly 200 — the daily
+cap — because once the empty-string key reached `DID_DAILY_CAP` the ring
+treated the unresolvable slot as capped and skipped it. **It self-heals at the
+cost of `DID_DAILY_CAP` rejected calls, and it does so again every day**, when
+the counters roll at 00:00 UTC.
+
+`render.sh` now hard-fails on ceiling 2 (`DID_POOL_ARG_MAX`, default 4096) and
+names how many numbers would actually be reachable. Raising that variable does
+not raise the buffer — it only re-enables the silent truncation.
+
+If you are ever caught with a pool already loaded that is over the limit, the
+runtime stopgap is to shrink the **count**, not the pool. It is short enough
+to clear ceiling 1, needs no restart, and drops no calls:
+
+```bash
+asterisk -rx "dialplan set global SBC_DID_CNT_OVERFLOW 335"
+asterisk -rx "database del sbc/didcnt/$(date -u +%Y%m%d) \"\""   # drop the empty-string key
+```
+
+That is a patch, not a fix: a runtime global does not survive a restart, so
+any unplanned restart silently reinstates the truncation. Re-render `dids.csv`
+under the limit and restart at the next quiet window.
+
 ### Add a customer signaling IP
 
 The customer brings up a new switch and it has to reach this box. Everything
