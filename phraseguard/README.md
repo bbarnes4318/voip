@@ -375,6 +375,50 @@ annotated list. The ones that matter most:
 
 ## Install
 
+### From Windows
+
+Do **not** double-click the `.sh` file — Windows will ask you which app to open
+it with, because a bash script is not a Windows program. Open a terminal.
+
+**Git Bash** (ships with Git for Windows, so you probably already have it).
+Right-click inside the checkout → *Git Bash Here*, or find *Git Bash* in the
+Start menu and `cd` to the folder:
+
+```bash
+./tools/deploy-phraseguard.sh --remote root@167.235.206.206 --dry-run
+./tools/deploy-phraseguard.sh --remote root@167.235.206.206 --install
+./tools/deploy-phraseguard.sh --remote root@167.235.206.206 --check
+```
+
+**PowerShell**, if you would rather not install anything. Windows 10 (1803+)
+and Windows 11 already ship `ssh.exe`, `scp.exe` and `tar.exe`:
+
+```powershell
+.\tools\deploy-phraseguard.ps1 -Remote root@167.235.206.206 -Action DryRun
+.\tools\deploy-phraseguard.ps1 -Remote root@167.235.206.206 -Action Install
+.\tools\deploy-phraseguard.ps1 -Remote root@167.235.206.206 -Action Check
+```
+
+If PowerShell refuses with *"running scripts is disabled on this system"*:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\deploy-phraseguard.ps1 -Remote root@167.235.206.206 -Action DryRun
+```
+
+The `.ps1` is only a courier: it packages the checkout, copies it over, and runs
+the same `.sh` on the box. Prefer Git Bash — it is one less wrapper between you
+and the result, and it is the path that gets exercised.
+
+### From macOS or Linux
+
+```bash
+./tools/deploy-phraseguard.sh --remote root@167.235.206.206 --dry-run
+./tools/deploy-phraseguard.sh --remote root@167.235.206.206 --install
+./tools/deploy-phraseguard.sh --remote root@167.235.206.206 --check
+```
+
+### On the box itself
+
 One command, from a checkout on the box:
 
 ```bash
