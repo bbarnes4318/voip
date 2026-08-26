@@ -437,6 +437,33 @@ head_ "4. settings"
 # customer IP list; this never edits a line that is already there.
 if grep -q 'PHRASEGUARD_ENFORCE' "$CONF" 2>/dev/null; then
   ok "config.env already has a PhraseGuard block — left exactly as it is"
+  # ...with ONE exception. If the block was written by an earlier run whose
+  # model download failed, PHRASEGUARD_VOSK_MODEL is empty and STAYS empty
+  # forever, because this branch refuses to touch an existing block. The model
+  # then installs successfully on the retry and is never wired in: the service
+  # comes up healthy with "model directory not found: ''" and detection
+  # silently off. That is exactly what happened on the first real deploy.
+  #
+  # Filling in an empty value is not the same as editing a setting somebody
+  # chose. A non-empty value is still left alone.
+  CUR_MODEL="$(sed -n 's/^[[:space:]]*PHRASEGUARD_VOSK_MODEL[[:space:]]*=[[:space:]]*//p' "$CONF" | head -1)"
+  if [[ -z "$CUR_MODEL" && -n "$MODEL_PATH" && -d "$MODEL_PATH" ]]; then
+    if (( DRY )); then
+      printf '  %s[dry-run]%s would fill in the empty PHRASEGUARD_VOSK_MODEL=%s\n' \
+             "$D" "$N" "$MODEL_PATH"
+    else
+      cp -a "$CONF" "$CONF.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+      sed -i "s|^[[:space:]]*PHRASEGUARD_VOSK_MODEL[[:space:]]*=.*|PHRASEGUARD_VOSK_MODEL=$MODEL_PATH|" "$CONF"
+      ok "filled in PHRASEGUARD_VOSK_MODEL=$MODEL_PATH (was empty)"
+      ok "detection is now ENABLED"
+    fi
+  elif [[ -n "$CUR_MODEL" ]]; then
+    ok "model already configured: $CUR_MODEL"
+  elif [[ -z "$MODEL_PATH" ]]; then
+    warn "PHRASEGUARD_VOSK_MODEL is empty and no model is installed"
+    say "${D}PhraseGuard will record calls but transcribe nothing. Install a${N}"
+    say "${D}model, then re-run this script to wire it in.${N}"
+  fi
 elif (( DRY )); then
   printf '  %s[dry-run]%s would append a PhraseGuard block to %s\n' "$D" "$N" "$CONF"
 else
