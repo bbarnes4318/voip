@@ -196,12 +196,15 @@ if [[ "$MODE" == "check" ]]; then
   fi
 
   head_ "is it seeing anything?"
+  # grep -c prints "0" AND exits 1 when there are no matches, so the `|| echo 0`
+  # this used to carry appended a SECOND zero and the line rendered as "0\n0".
+  # grep -c cannot fail in a way that needs a fallback; drop it.
   TODAY="$LOG_DIR/phraseguard-$(date -u +%Y%m%d).jsonl"
   if [[ -r "$TODAY" ]]; then
-    N_MATCH="$(grep -c '"event": "match"' "$TODAY" 2>/dev/null || echo 0)"
-    N_START="$(grep -c '"event": "start"' "$TODAY" 2>/dev/null || echo 0)"
+    N_MATCH="$(grep -c '"event": "match"' "$TODAY" 2>/dev/null)"
+    N_START="$(grep -c '"event": "start"' "$TODAY" 2>/dev/null)"
     ok "today's evidence log: $TODAY"
-    say "matches recorded today: $N_MATCH   (daemon starts: $N_START)"
+    say "matches recorded today: ${N_MATCH:-0}   (daemon starts: ${N_START:-0})"
   else
     warn "no evidence log for today at $TODAY"
     say "${D}normal if the daemon has just started, or if the trunk is quiet${N}"
@@ -210,10 +213,33 @@ if [[ "$MODE" == "check" ]]; then
   CH="$(asterisk -rx 'core show channels' 2>/dev/null \
         | sed -n 's/^\([0-9]\{1,\}\) active channels\{0,1\}.*/\1/p' | head -1)"
   say "active Asterisk channels right now: ${CH:-unknown}"
+
+  # Report the trunk's ACTUAL state from the CDR, not a claim copied out of a
+  # document. This used to assert "the trunk has been paused since 2026-08-12"
+  # because HANDOFF.md said so -- and by the time anyone read it on the box the
+  # trunk was carrying nearly 200 calls a day. A status tool that repeats a
+  # stale doc as present-tense fact is worse than one that says nothing.
+  CDR="${CDR_CSV_PATH:-/var/log/asterisk/cdr-custom/sbc.csv}"
+  if [[ -r "$CDR" ]]; then
+    LAST_CDR="$(tail -1 "$CDR" 2>/dev/null | cut -d'"' -f2)"
+    if [[ -n "$LAST_CDR" ]]; then
+      LAST_EPOCH="$(date -d "$LAST_CDR" +%s 2>/dev/null || echo 0)"
+      if (( LAST_EPOCH > 0 )); then
+        AGE_MIN=$(( ( $(date +%s) - LAST_EPOCH ) / 60 ))
+        if (( AGE_MIN < 60 )); then
+          ok "trunk is LIVE — last call ${AGE_MIN}m ago ($LAST_CDR)"
+        else
+          say "last call in the CDR: $LAST_CDR (${AGE_MIN}m ago)"
+        fi
+      fi
+    fi
+  fi
+
   if [[ "${CH:-0}" == "0" ]]; then
-    warn "no calls are up, so there is nothing for PhraseGuard to hear"
-    say "${D}HANDOFF.md: the trunk has been paused since 2026-08-12. Until it${N}"
-    say "${D}returns, a running daemon and an empty log is the CORRECT state.${N}"
+    warn "no calls are up right now, so there is nothing for PhraseGuard to hear"
+    say "${D}A running daemon and an empty log is the CORRECT state while the${N}"
+    say "${D}trunk is quiet, or while calls are being rejected before answer${N}"
+    say "${D}(PORTAL_NO_FUNDS rejects never carry audio).${N}"
   fi
 
   head_ "per-customer record (the thing that answers a traceback)"
