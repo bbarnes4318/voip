@@ -149,7 +149,9 @@ class PhraseGuard(object):
         self.asr.load()
 
         self.cli = AsteriskCLI(cfg.asterisk)
-        self.table = ChannelTable(self.cli)
+        # Probe only the customer endpoints. See ChannelTable.endpoints.
+        self.table = ChannelTable(
+            self.cli, endpoints=endpoint_map(cfg.customer_ips).values())
         self.resolver = ChannelResolver(
             self.table, endpoint_map(cfg.customer_ips),
             allow_heuristic=cfg.allow_heuristic)

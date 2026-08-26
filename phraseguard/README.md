@@ -20,22 +20,53 @@ call it, wrap it, import it or modify it.
 
 | phase | what | state |
 |---|---|---|
-| 1 | Call-ID → channel spike | **built, NOT RUN** — needs the box and live traffic |
-| 2 | capture and demux | built, proven on fixtures; stream counts need live traffic |
-| 3 | ASR sidecar | built; **cores/stream and accuracy unmeasured** — needs a model and real audio |
+| 1 | Call-ID → channel spike | **PASSED on live traffic**, 2026-08-26 — see below |
+| 2 | capture and demux | deployed; stream counts still to be measured on answered calls |
+| 3 | ASR sidecar | deployed with `vosk-model-small-en-us-0.15`; **cores/stream and accuracy unmeasured** |
 | 4 | matcher and corpus | built and tested offline |
-| 5 | shadow mode | ready to deploy; **no traffic days run** |
+| 5 | shadow mode | **running** since 2026-08-26 14:13 UTC; no traffic days reviewed yet |
 | 6 | enforcement | not started, and must not start before phase 5 is reviewed |
 
-Two things block phases 1, 3 and 5, and neither is a code problem:
+### Phase 1 result — measured, not estimated
 
-- **The trunk is paused.** No traffic and no new CDR since 2026-08-12 20:23 UTC
-  (`HANDOFF.md` § Trunk is paused). Every remaining measurement needs live calls.
-- Production is read-only for analysis, and everything that writes goes to the
-  lab box first (`HANDOFF.md` § Standing constraints).
+`tools/phraseguard-spike.sh --arm`, 120 s against live traffic, 12 channels up:
 
-Run `tools/phraseguard-spike.sh --arm` the moment the trunk returns. Nothing
-downstream is trustworthy until it passes.
+```
+INVITEs observed     51
+resolved             51   100.0%
+  exact (SBC_CALLID) 51   100.0%
+  heuristic fallback  0     0.0%
+AMBIGUOUS             0     0.0%
+unresolved            0     0.0%
+
+cost of ONE resolve() call
+  p50 17.7 ms   p90 32.6 ms   max 52.9 ms
+
+asterisk -rx calls   142  (6.0 ms each, 0 errors)
+```
+
+**Every Call-ID observed on the wire resolved exactly**, via the `__SBC_CALLID`
+channel variable the dialplan already sets. The heuristic fallback was never
+needed and stays off.
+
+The p50 of 700 ms for "INVITE on the wire → channel name in hand" is the 0.5 s
+poll interval, not the resolution cost; a resolve costs ~18 ms and the whole
+lookup is served from a cache that costs one `asterisk -rx` per new call.
+
+`asterisk -rx` at 6.0 ms with zero errors across 142 calls also settles the AMI
+question in practice: a persistent AMI connection would save single-digit
+milliseconds on an event that fires rarely, and is not worth a TCP listener and
+a credentials file on this box.
+
+### What is still unmeasured
+
+- **Cores per concurrent ASR stream.** `asr.py --bench` on the box.
+- **Utterance → BYE latency.** Needs answered calls carrying audio.
+- **False-positive rate.** Five full traffic days in shadow mode.
+
+At the time of writing the trunk is live but every call rejects
+`CONGESTION` / `PORTAL_NO_FUNDS` before answer, so no call carries audio yet.
+An empty evidence log in that state is correct, not broken.
 
 ---
 

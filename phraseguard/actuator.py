@@ -239,10 +239,21 @@ class ChannelTable(object):
     F_DURATION = 11
     F_UNIQUEID = 13
 
-    def __init__(self, cli, list_ttl=1.0, channel_prefix="PJSIP/"):
+    def __init__(self, cli, list_ttl=1.0, channel_prefix="PJSIP/",
+                 endpoints=None):
         self.cli = cli
         self.list_ttl = list_ttl
         self.channel_prefix = channel_prefix
+        # Only these endpoints are worth probing. `__SBC_CALLID` is set in
+        # [sbc-customer], so the carrier legs either never carry it or carry a
+        # copy we have no use for -- the channel PhraseGuard hangs up is always
+        # the customer leg.
+        #
+        # The first live spike showed the cost: 10 channels probed, 5 with no
+        # SBC_CALLID, and each of those burns MAX_PROBE_MISSES forks before it
+        # is written off. Filtering removes that entirely. None means probe
+        # everything, which is what the spike does when it has no endpoint map.
+        self.endpoints = frozenset(endpoints) if endpoints else None
         self.channels = {}
         self.by_call_id = {}
         self.last_list = 0.0
@@ -354,6 +365,9 @@ class ChannelTable(object):
         n = 0
         for name, ch in list(self.channels.items()):
             if ch.probed:
+                continue
+            if self.endpoints is not None and ch.endpoint not in self.endpoints:
+                ch.probed = True          # not ours; never worth a fork
                 continue
             self.probe(name)
             n += 1
