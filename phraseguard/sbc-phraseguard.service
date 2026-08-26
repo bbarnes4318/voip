@@ -1,0 +1,89 @@
+[Unit]
+# ===========================================================================
+# sbc-phraseguard.service — the PhraseGuard detector.
+#
+# DEPLOYED SEPARATELY FROM install.sh, ON PURPOSE.
+#
+# install.sh ends with `systemctl restart asterisk`. PhraseGuard's whole
+# premise is that it can be added and removed without an Asterisk restart, so
+# wiring it into install.sh would make installing the detector a voice event.
+# It is installed by hand instead:
+#
+#     install -m 0644 phraseguard/sbc-phraseguard.service \
+#             /etc/systemd/system/sbc-phraseguard.service
+#     systemctl daemon-reload
+#     systemctl enable --now sbc-phraseguard.service
+#
+# and removed the same way. Neither touches Asterisk.
+#
+# ORDERING, NOT DEPENDENCY. After= without Requires= or BindsTo= is
+# deliberate and is the single most important line in this file. A Requires=
+# on asterisk.service would let a crash-looping detector drag the trunk with
+# it, which is precisely the failure the brief forbids: a monitoring problem
+# must not become a voice problem.
+# ===========================================================================
+Description=PhraseGuard scam-phrase detection (out-of-band, fail-open)
+Documentation=file:///opt/sbc/phraseguard/README.md
+After=network-online.target asterisk.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sbc
+ExecStart=/usr/bin/python3 /opt/sbc/phraseguard/phraseguardd.py --config /opt/sbc/config.env
+
+# Root is required and cannot be dropped: the tap needs CAP_NET_RAW for
+# tcpdump, and `asterisk -rx` needs the control socket in /var/run/asterisk,
+# which is root/asterisk-group only. AmbientCapabilities alone is not enough
+# for the second of those.
+User=root
+
+# --- resource ceilings ----------------------------------------------------
+# PhraseGuard must never be the reason Asterisk cannot get a core to relay
+# media on. Nice=10 means the kernel hands CPU to Asterisk first under
+# contention; CPUQuota is the hard ceiling on top of that.
+#
+# 200% = two cores. Size this from the MEASURED cores-per-stream figure that
+# phraseguard/asr.py --bench reports on this box, not from this default: the
+# right number is (peak concurrent gated streams x realtime factor), rounded
+# up, and it belongs in the deploy notes alongside the measurement.
+Nice=10
+CPUQuota=200%
+MemoryMax=2G
+# OOM-kill this before anything else on the box. A detector is not worth a
+# page fault in the media path.
+OOMScoreAdjust=500
+
+# --- restart policy -------------------------------------------------------
+# on-failure, not always: a clean exit is a deliberate stop and should stay
+# stopped. The burst limit stops a persistently broken build from forking
+# tcpdump every second forever -- after 5 failures in 5 minutes it gives up
+# and the unit sits failed, which is visible in healthcheck output and is a
+# far better state than a hidden restart loop.
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# --- filesystem -----------------------------------------------------------
+# The only writable paths are the evidence log and the counter state. In
+# particular /etc is read-only: PhraseGuard reads manager.conf and
+# extensions.conf and must never be able to write to either.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/phraseguard /var/lib/phraseguard /run
+StateDirectory=phraseguard
+LogsDirectory=phraseguard
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+
+# SIGHUP reloads phrases.csv without a restart:  systemctl reload sbc-phraseguard
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

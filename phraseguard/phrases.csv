@@ -1,0 +1,382 @@
+> tier,category,lang,anchor,phrase,notes
+# ===========================================================================
+# phraseguard/phrases.csv — the scam-script corpus.
+#
+# Loaded by phraseguard/matcher.py. Hot-reloaded on mtime change and on
+# SIGHUP; no daemon restart and certainly no Asterisk restart. Nothing in
+# here is duplicated in source — this file is the only place phrases live.
+#
+# Lines beginning with '#' are comments. The header line above is prefixed
+# with '> ' so that the column order is self-describing without being
+# mistaken for data.
+#
+# COLUMNS
+#   tier      A  disconnect on a single confident match (when enforcing)
+#             B  score only; two distinct B categories in a 90s window, or
+#                one B plus an A-near, raises a B threshold event
+#             C  suppressor; reduces B score in the same window, never fires
+#                anything on its own
+#             X  exclusion; vetoes any A/B match overlapping its token span.
+#                These are legitimate insurance qualification questions that
+#                sit inside the edit distance of a Tier A phrase.
+#   category  A1..A8, B1..B6, C1..C2, X1. Category is the unit the B scorer
+#             counts distinct hits over, so it is load-bearing, not a label.
+#   lang      en | ur | es. The daemon loads only the languages named in
+#             PHRASEGUARD_LANGS (default "en"). The ur rows below are a SEED
+#             FOR NATIVE-SPEAKER REVIEW and are deliberately not loaded by
+#             default — see the header comment above the ur block.
+#   anchor    how this phrase is matched. See matcher.py for the rules.
+#             brand  1-2 token distinctive proper/product noun. Matched
+#                    phonetically (Double Metaphone over the span with
+#                    whitespace removed) so "anydesk" / "any desk" /
+#                    "anydisk" / "any disc" are one entry, not four.
+#             pair   exactly 2 tokens, a distinctive collocation that is not
+#                    a proper noun. Fuzzy, but at a tighter threshold than
+#                    seq because two tokens leave little room to be wrong in.
+#             seq    3+ tokens. Fuzzy token-sequence match with a Levenshtein
+#                    budget proportional to phrase length.
+#   phrase    the phrase, in ordinary spelling. Normalisation (lowercasing,
+#             punctuation, digit/word folding) happens at load time — write
+#             it the way a person would say it.
+#   notes     free text. Anything marked DEMOTE-CANDIDATE is a phrase whose
+#             tokens are individually common enough that shadow mode is
+#             expected to be the thing that decides whether it survives.
+#
+# THE ANCHOR COLUMN IS NOT DECORATION. The brief's rule is "a single common
+# token is never a Tier A phrase; every A entry is either a distinctive brand
+# noun or a phrase of three or more words." anchor is how that rule is made
+# checkable instead of remembered: tools/phraseguard-lint.py refuses a Tier A
+# row whose anchor and token count disagree, and refuses a brand/pair row
+# built only out of common English words. A corpus edit that breaks the rule
+# fails the lint rather than quietly widening what gets disconnected.
+#
+# HOW TO DEMOTE A PHRASE. Shadow mode will produce Tier A phrases that fire
+# on legitimate insurance traffic. The brief's instruction is to demote them,
+# not to tune around them: change tier A -> B on that row and leave everything
+# else alone. Do not raise a threshold to silence one phrase — thresholds are
+# global and that trades a false positive here for a miss everywhere else.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# TIER A1 — remote access software.
+# No consumer cold call has a legitimate reason to name these. An insurance
+# agent never needs to see the prospect's screen.
+# ---------------------------------------------------------------------------
+A,A1,en,brand,anydesk,brand noun; phonetic match also covers "any desk"/"anydisk"/"any disc"
+A,A1,en,brand,any desk,spelled-apart form; same metaphone code as anydesk
+A,A1,en,brand,ultraviewer,
+A,A1,en,brand,ultra viewer,
+A,A1,en,brand,teamviewer,
+A,A1,en,brand,team viewer,
+A,A1,en,brand,logmein,
+A,A1,en,seq,log me in,DEMOTE-CANDIDATE — three common tokens; watch this one in shadow
+A,A1,en,brand,gotoassist,
+A,A1,en,brand,screenconnect,
+A,A1,en,pair,connectwise control,
+A,A1,en,brand,splashtop,
+A,A1,en,pair,zoho assist,
+A,A1,en,pair,ammyy admin,
+A,A1,en,brand,aeroadmin,
+A,A1,en,brand,rustdesk,
+A,A1,en,brand,dwservice,
+A,A1,en,pair,supremo remote,
+A,A1,en,pair,quick assist,DEMOTE-CANDIDATE — "quick assist" occurs as ordinary English
+A,A1,en,seq,chrome remote desktop,
+A,A1,en,seq,remote desktop connection,
+A,A1,en,seq,install the software I send you,
+A,A1,en,seq,download the application from that link,
+A,A1,en,seq,give me the nine digit id,digit/word folding makes "9 digit" and "nine digit" one phrase
+A,A1,en,seq,allow the connection on your screen,
+
+# ---------------------------------------------------------------------------
+# TIER A2 — gift card payment.
+# A gift card is never a payment instrument on a legitimate sales call, in
+# either direction. This is the least ambiguous category in the corpus.
+# ---------------------------------------------------------------------------
+A,A2,en,pair,gift card,
+A,A2,en,pair,gift cards,
+A,A2,en,seq,google play card,
+A,A2,en,seq,apple gift card,
+A,A2,en,pair,itunes card,
+A,A2,en,pair,steam card,
+A,A2,en,pair,vanilla card,
+A,A2,en,pair,vanilla reload,
+A,A2,en,brand,moneypak,
+A,A2,en,seq,green dot card,
+A,A2,en,seq,target gift card,
+A,A2,en,seq,walmart gift card,
+A,A2,en,seq,best buy gift card,
+A,A2,en,seq,ebay gift card,
+A,A2,en,seq,sephora gift card,
+A,A2,en,pair,razer gold,
+A,A2,en,seq,scratch off the back,
+A,A2,en,seq,read me the numbers on the back,
+A,A2,en,seq,the code on the back of the card,
+A,A2,en,seq,peel the silver strip,
+A,A2,en,seq,buy them in denominations of,
+
+# ---------------------------------------------------------------------------
+# TIER A3 — crypto and cash conversion.
+# Kiosk brands survive a language switch untranslated, which is most of why
+# this category keeps its value against an Urdu or Punjabi script.
+# ---------------------------------------------------------------------------
+A,A3,en,pair,bitcoin atm,
+A,A3,en,pair,crypto atm,
+A,A3,en,pair,bitcoin depot,
+A,A3,en,brand,coinme,
+A,A3,en,brand,rockitcoin,
+A,A3,en,pair,athena bitcoin,
+A,A3,en,brand,coinstar,
+A,A3,en,pair,wallet address,
+A,A3,en,seq,scan the qr code at the machine,
+A,A3,en,seq,convert your funds,
+A,A3,en,pair,gold bars,
+A,A3,en,seq,purchase precious metals,
+A,A3,en,seq,a courier will collect the cash,
+A,A3,en,seq,our courier will come to your address,
+A,A3,en,seq,put the cash in a shoebox,
+A,A3,en,seq,hand the package to our agent,
+
+# ---------------------------------------------------------------------------
+# TIER A4 — wire and cash-out under instruction.
+# ---------------------------------------------------------------------------
+A,A4,en,brand,western union,
+A,A4,en,brand,moneygram,
+A,A4,en,seq,wire the funds today,
+A,A4,en,pair,cashiers check,apostrophe is stripped at normalisation; written bare to match
+A,A4,en,seq,certified check made out to,
+A,A4,en,seq,withdraw the cash from your account,
+A,A4,en,pair,safe account,DEMOTE-CANDIDATE — two common tokens; the A4 anchor is the instruction around it
+A,A4,en,seq,federal safe account,
+A,A4,en,seq,government protected account,
+A,A4,en,seq,we will hold the money for you,
+A,A4,en,pair,secure locker,
+
+# ---------------------------------------------------------------------------
+# TIER A5 — government impersonation and legal threat.
+# These translate cleanly, so an Urdu-script floor makes this category
+# invisible to an English-only recogniser. Documented in README.md §Evasions.
+# ---------------------------------------------------------------------------
+A,A5,en,seq,social security number has been suspended,
+A,A5,en,seq,social security number is suspended,
+A,A5,en,seq,suspension of your social,
+A,A5,en,seq,your social has been compromised,
+A,A5,en,pair,arrest warrant,
+A,A5,en,seq,federal arrest warrant,
+A,A5,en,seq,warrant for your arrest,
+A,A5,en,seq,warrant has been issued in your name,
+A,A5,en,seq,marshals are on the way,
+A,A5,en,seq,law enforcement is on the way to your address,
+A,A5,en,seq,you will be arrested,
+A,A5,en,seq,if you hang up you will be arrested,
+A,A5,en,seq,your assets will be frozen,
+A,A5,en,seq,your accounts will be seized,
+A,A5,en,seq,money laundering charges,
+A,A5,en,seq,narcotics were found,
+A,A5,en,seq,a rental car registered in your name,
+A,A5,en,seq,abandoned vehicle near the border,
+A,A5,en,seq,blood stains were found,
+
+# ---------------------------------------------------------------------------
+# TIER A6 — isolation and coaching to deceive.
+# The brief calls this the single strongest scam signal in the corpus, and it
+# is the one category with no legitimate analogue anywhere in outbound sales:
+# a licensed agent has no reason to tell a prospect what to say to their bank.
+# ---------------------------------------------------------------------------
+A,A6,en,seq,do not tell the bank,
+A,A6,en,seq,dont tell the teller,apostrophe stripped at normalisation
+A,A6,en,seq,do not discuss this with anyone,
+A,A6,en,seq,keep this confidential,
+A,A6,en,seq,tell them it is for a home renovation,
+A,A6,en,seq,tell them you are buying a car,
+A,A6,en,seq,if the bank asks you,
+A,A6,en,seq,if anyone asks you say,
+A,A6,en,seq,stay on the line while you drive,
+A,A6,en,seq,do not hang up the phone,
+A,A6,en,seq,your line is being monitored,
+A,A6,en,seq,do not tell your family,
+A,A6,en,seq,this is under a gag order,
+
+# ---------------------------------------------------------------------------
+# TIER A7 — credential and OTP harvesting.
+# Read the X1 exclusions below at the same time. "last four of your social" is
+# a legitimate insurance qualifier and sits well inside the edit distance of
+# "your complete social" — the exclusion veto is what keeps that call up.
+# ---------------------------------------------------------------------------
+A,A7,en,seq,the six digit code we just sent,
+A,A7,en,seq,one time passcode,
+A,A7,en,seq,read me the code from your phone,
+A,A7,en,seq,read back the verification code,
+A,A7,en,seq,your online banking password,
+A,A7,en,seq,your netbanking password,
+A,A7,en,seq,the three digits on the back of your card,
+A,A7,en,seq,the security code on the back,
+A,A7,en,pair,cvv number,
+A,A7,en,seq,your full social security number,
+A,A7,en,seq,your complete social,
+
+# ---------------------------------------------------------------------------
+# TIER A8 — refund and tech-support scam anchors.
+# ---------------------------------------------------------------------------
+A,A8,en,pair,refund department,
+A,A8,en,seq,we accidentally refunded,
+A,A8,en,seq,we sent too much money,
+A,A8,en,seq,you were overpaid,
+A,A8,en,seq,you have been overcharged and we,
+A,A8,en,seq,type the amount into the field,
+A,A8,en,seq,geek squad renewal,
+A,A8,en,seq,geek squad auto renewal,
+A,A8,en,seq,norton auto renewal,
+A,A8,en,seq,mcafee subscription renewal,
+A,A8,en,seq,your computer is sending out,
+A,A8,en,seq,your ip address has been compromised,
+A,A8,en,seq,your device is infected with,
+A,A8,en,seq,microsoft technical support,
+A,A8,en,seq,windows support department,
+A,A8,en,seq,your subscription auto renewed for,
+
+# ---------------------------------------------------------------------------
+# TIER X1 — exclusions. NEVER match; veto any A/B hit overlapping their span.
+#
+# Every one of these is a question a licensed insurance agent asks on a
+# legitimate final-expense or Medicare call. They are here because the fuzzy
+# matcher would otherwise reach them from A7, not because they are suspicious.
+# ---------------------------------------------------------------------------
+X,X1,en,seq,last four of your social,vetoes A7 "your complete social"/"your full social security number"
+X,X1,en,seq,last four digits of your social,the "digits" variant - one token past the edit budget of the row above so it needs its own entry
+X,X1,en,seq,date of birth,
+X,X1,en,pair,your zip code,
+X,X1,en,pair,your beneficiary,
+X,X1,en,seq,height and weight,
+
+# ---------------------------------------------------------------------------
+# TIER B1 — agency impersonation.
+# Naming an agency is not by itself a scam: a compliant Medicare agent says
+# "Medicare" constantly. That is why these score rather than disconnect, and
+# why C1 (the not-affiliated disclaimer) is weighted as heavily as it is.
+# ---------------------------------------------------------------------------
+B,B1,en,seq,social security administration,
+B,B1,en,seq,office of inspector general,
+B,B1,en,seq,internal revenue service,
+B,B1,en,seq,medicare fraud unit,
+B,B1,en,seq,federal trade commission,
+B,B1,en,seq,us marshals service,
+B,B1,en,seq,drug enforcement administration,
+B,B1,en,pair,homeland security,
+B,B1,en,seq,customs and border protection,
+B,B1,en,seq,this is officer,
+B,B1,en,pair,badge number,
+B,B1,en,seq,my badge id,
+B,B1,en,pair,case number,
+B,B1,en,seq,case id number,
+B,B1,en,pair,docket number,
+B,B1,en,seq,affidavit against you,
+
+# ---------------------------------------------------------------------------
+# TIER B2 — urgency and threat.
+# ---------------------------------------------------------------------------
+B,B2,en,seq,within the next thirty minutes,
+B,B2,en,pair,final notice,
+B,B2,en,pair,last warning,
+B,B2,en,seq,before end of business today,
+B,B2,en,seq,your license will be suspended,
+B,B2,en,seq,your power will be disconnected,
+B,B2,en,pair,disconnection within,
+B,B2,en,seq,your benefits will stop immediately,
+
+# ---------------------------------------------------------------------------
+# TIER B3 — prize and lottery.
+# ---------------------------------------------------------------------------
+B,B3,en,seq,you have won,
+B,B3,en,seq,publishers clearing house,
+B,B3,en,seq,claim your prize,
+B,B3,en,seq,processing fee to release,
+B,B3,en,seq,customs fee to release,
+B,B3,en,pair,sweepstakes winner,
+B,B3,en,seq,taxes on your winnings,
+
+# ---------------------------------------------------------------------------
+# TIER B4 — advance fee.
+# The nearest neighbour to legitimate lead-gen in the whole corpus. "no credit
+# check" and "guaranteed approval" appear in real subprime auto and personal
+# loan scripts, which is exactly why they are B and not A.
+# ---------------------------------------------------------------------------
+B,B4,en,pair,guaranteed approval,
+B,B4,en,seq,no credit check loan,
+B,B4,en,seq,insurance fee to release the loan,
+B,B4,en,seq,first payment upfront,
+B,B4,en,pair,activation fee,
+B,B4,en,seq,the fee is refundable once,
+
+# ---------------------------------------------------------------------------
+# TIER B5 — family emergency.
+# ---------------------------------------------------------------------------
+B,B5,en,pair,your grandson,
+B,B5,en,seq,your grandson is in jail,
+B,B5,en,pair,posted bail,
+B,B5,en,pair,bail money,
+B,B5,en,seq,the public defender,
+B,B5,en,seq,he asked me not to tell you,
+
+# ---------------------------------------------------------------------------
+# TIER B6 — investment and pig butchering.
+# ---------------------------------------------------------------------------
+B,B6,en,pair,guaranteed returns,
+B,B6,en,seq,risk free investment,
+B,B6,en,seq,double your money,
+B,B6,en,seq,our trading platform,
+B,B6,en,seq,deposit to unlock your withdrawal,
+B,B6,en,seq,withdrawal fee before we release,
+
+# ---------------------------------------------------------------------------
+# TIER C1 — the government-agency disclaimer.
+# The highest-value suppressor in the corpus and weighted separately from the
+# rest for that reason (PHRASEGUARD_C1_WEIGHT, default 1.5). A floor reading
+# this is a floor with a compliance script, and no scam floor reads it.
+# ---------------------------------------------------------------------------
+C,C1,en,seq,not affiliated with any government agency,
+C,C1,en,seq,we are not affiliated with medicare,
+
+# ---------------------------------------------------------------------------
+# TIER C2 — the rest of the compliance disclaimers.
+# ---------------------------------------------------------------------------
+C,C2,en,seq,licensed insurance agent,
+C,C2,en,seq,state licensed agent,
+C,C2,en,seq,this call may be recorded for quality,
+C,C2,en,seq,you can be removed from our list,
+C,C2,en,pair,no obligation,
+C,C2,en,seq,a licensed agent will call you back,
+
+# ===========================================================================
+# URDU SEED SET — lang=ur. NOT LOADED BY DEFAULT.
+#
+# PHRASEGUARD_LANGS defaults to "en". These rows are in the file so a native
+# speaker has something concrete to correct and extend; they are not loaded
+# until someone sets PHRASEGUARD_LANGS=en,ur, and nobody should set that until
+# the review has happened.
+#
+# The brief is explicit that machine-generated transliterations must not be
+# treated as authoritative, and it is right to be: Roman-Urdu has no settled
+# orthography, an English acoustic model will render these unpredictably, and
+# a wrong Tier A row here disconnects a legitimate call in a language nobody
+# reviewing the logs reads. Every row is tier B on purpose — a reviewer can
+# promote to A after confirming both the wording and how the recogniser
+# actually spells it, which is not knowable without hand-labelled audio off
+# this trunk.
+#
+# Note which categories are seeded. A1/A2/A3/A7 keep most of their value in
+# any language because the product and brand nouns embed untranslated — a
+# Karachi floor still says "gift card", "AnyDesk", "Bitcoin", "OTP", "code".
+# A5 and A6 do not survive translation and are the real gap.
+# ===========================================================================
+B,A2,ur,seq,gift card kharido,SEED - unreviewed. "buy a gift card"
+B,A2,ur,seq,card ka number batao,SEED - unreviewed. "tell me the card number"
+B,A2,ur,seq,card ke peeche ka code,SEED - unreviewed. "the code on the back of the card"
+B,A1,ur,seq,anydesk download karo,SEED - unreviewed. brand noun embeds untranslated
+B,A1,ur,seq,software install karo,SEED - unreviewed
+B,A7,ur,pair,code batao,SEED - unreviewed. "tell me the code"
+B,A7,ur,pair,otp batao,SEED - unreviewed. "tell me the OTP"
+B,A3,ur,seq,bitcoin machine par jao,SEED - unreviewed. "go to the bitcoin machine"
+B,A6,ur,seq,kisi ko mat batana,SEED - unreviewed. "do not tell anyone" - the A6 analogue
+B,A6,ur,seq,bank ko mat batana,SEED - unreviewed. "do not tell the bank"
+B,A5,ur,seq,warrant nikal gaya hai,SEED - unreviewed. "a warrant has been issued"

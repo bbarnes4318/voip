@@ -313,8 +313,15 @@ healthcheck.sh          exit 0/1/2 on trunk and box health; runs on a systemd ti
 
 tools/build-blocklist.py  regenerate blocklist.csv from the carrier rate deck
 asterisk/*.tpl          rendered configs. Only .tpl is tracked; rendered .conf is gitignored.
+phraseguard/            scam-phrase detection, out of band. Read phraseguard/README.md.
 tests/                  SIPp scenarios + driver. Read tests/README.md first.
 ```
+
+`phraseguard/` is a separate component with its own lifecycle: it is not
+installed by `install.sh`, it has its own systemd unit, and it can be added or
+removed without restarting Asterisk. It taps packets and reads channel state;
+it is not in the call path. Note that it is **not** `killswitch.sh` and has
+nothing to do with it.
 
 `config.env`, `dids.csv` and `blocklist.csv` all hold real values and are all
 gitignored. Only the `.example` versions are tracked.

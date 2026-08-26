@@ -77,8 +77,14 @@ WRITE_SHA=""
 #                            Phase 1. Its own header claims render.sh and
 #                            firewall.sh source it; neither does.
 #   tools/analyze-did-capacity.py   workstation tool, never deployed.
+#   tools/testdata/**        fixture generators, workstation only.
 #   *.example, *.md, .git*   documentation and samples.
 #   config.env, dids.csv, blocklist.csv   per-box state, not repo content.
+#
+# NOT a rendered output either: sbc-phraseguard.service is tracked in the list
+# below as a repo file, but the copy under /etc/systemd/system is installed by
+# hand and is not in RENDERED[] -- render.sh does not produce it and Asterisk
+# does not read it. If the two drift, systemd is running the one in /etc.
 TRACKED=(
   # render.sh's inputs: everything that becomes /etc/asterisk
   asterisk/cdr.conf.tpl
@@ -104,6 +110,24 @@ TRACKED=(
   # tools invoked on the box
   tools/build-blocklist.py
   tools/fractel-order.py
+  # PhraseGuard. Runs on the box as sbc-phraseguard.service, so it is deployed
+  # and therefore tracked. phrases.csv is IN here deliberately: it is the file
+  # that decides which calls get disconnected, an operator edits it by hand,
+  # and "which corpus is running" has to be as answerable as "which dialplan".
+  # A hot reload changes behaviour without changing a template, which is
+  # exactly the drift this stamp exists to catch.
+  phraseguard/phrases.csv
+  phraseguard/metaphone.py
+  phraseguard/matcher.py
+  phraseguard/tap.py
+  phraseguard/asr.py
+  phraseguard/actuator.py
+  phraseguard/record.py
+  phraseguard/phraseguardd.py
+  phraseguard/spike.py
+  phraseguard/sbc-phraseguard.service
+  tools/phraseguard-spike.sh
+  tools/phraseguard-lint.py
 )
 
 # The files Asterisk actually reads. TRACKED covers the INPUTS to render.sh --
