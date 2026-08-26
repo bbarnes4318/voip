@@ -577,14 +577,20 @@ echo
 echo "  ${B}What to do next${N}"
 echo "    1. Confirm it is alive:      $0 --check"
 echo "    2. Watch it live:            journalctl -t sbc-phraseguard -f"
-echo "    3. Once traffic returns, prove the hangup path works:"
+echo "    3. Prove the hangup path on live traffic:"
 echo "                                 $SBC_DIR/tools/phraseguard-spike.sh --arm"
-echo "    4. After 5 full traffic days, review what it WOULD have killed:"
-echo "                                 python3 $DEST/phraseguardd.py --status"
-echo "    5. Only then, and only if that review is clean, set"
-echo "       PHRASEGUARD_ENFORCE=1 in $CONF and:"
-echo "                                 systemctl restart sbc-phraseguard"
-echo "       ${D}(that restarts PhraseGuard, never Asterisk)${N}"
+echo "    4. See what it is matching:  python3 $DEST/phraseguardd.py --status"
+if grep -qE '^[[:space:]]*PHRASEGUARD_ENFORCE[[:space:]]*=[[:space:]]*1' "$CONF" 2>/dev/null; then
+  # Already enforcing. Telling the operator to "set PHRASEGUARD_ENFORCE=1" here
+  # is stale advice that reads as though it were not on.
+  echo "    5. Review what it has DISCONNECTED, regularly:"
+  echo "                                 python3 $DEST/record.py"
+else
+  echo "    5. Only after reviewing that, and only if it is clean, set"
+  echo "       PHRASEGUARD_ENFORCE=1 in $CONF and:"
+  echo "                                 systemctl restart sbc-phraseguard"
+  echo "       ${D}(that restarts PhraseGuard, never Asterisk)${N}"
+fi
 echo
 echo "  ${D}Uninstall at any time with: $0 --uninstall${N}"
 echo

@@ -12,8 +12,13 @@
   one less wrapper between you and the result.
 
   Nothing here restarts or reloads Asterisk, and nothing writes to
-  /etc/asterisk. The install runs in SHADOW MODE: it detects and records, and
-  it hangs up nothing until you deliberately change one setting.
+  /etc/asterisk.
+
+  A FIRST install defaults to shadow mode: it detects and records and hangs up
+  nothing. Whether a given box is enforcing is decided by PHRASEGUARD_ENFORCE
+  in its config.env, which this wrapper cannot see -- the box-side script reads
+  it and reports the real mode at the end of every run. Trust that line, not
+  this one.
 
 .PARAMETER Remote
   user@host for the SBC, e.g. root@167.235.206.206
@@ -192,9 +197,12 @@ Write-Host ""
 if ($rc -eq 0) {
     Ok "finished on $Remote"
     if ($Action -eq 'Install') {
+        # Deliberately does NOT restate the mode. This wrapper cannot see
+        # config.env on the box, and a hardcoded "running in SHADOW MODE" here
+        # printed exactly that after an ENFORCING install -- directly beneath
+        # the box-side script correctly saying the opposite. One source of
+        # truth, and it is the one running next to the config file.
         Write-Host ""
-        Say "PhraseGuard is running in SHADOW MODE: it records, it hangs up nothing."
-        Say ""
         Say "Next:"
         Say "  .\tools\deploy-phraseguard.ps1 -Remote $Remote -Action Check"
         Say "  ssh $Remote 'journalctl -t sbc-phraseguard -f'"
