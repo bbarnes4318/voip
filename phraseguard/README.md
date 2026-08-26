@@ -58,11 +58,40 @@ question in practice: a persistent AMI connection would save single-digit
 milliseconds on an event that fires rarely, and is not worth a TCP listener and
 a credentials file on this box.
 
+### Phase 3 result — ASR fits on the SBC
+
+`asr.py --bench` on the box, `vosk-model-small-en-us-0.15` with the corpus
+grammar, 2026-08-26:
+
+| concurrent streams | realtime factor | = cores/stream |
+|---|---|---|
+| 1 | 0.0150 | 0.0150 |
+| 4 | 0.0159 | 0.0159 |
+| 16 | 0.0172 | 0.0172 |
+
+Realtime factor **is** cores per concurrent stream — a stream produces audio in
+real time, so RTF 0.017 keeps 1.7% of a core busy for as long as it runs.
+Contention is mild (1 → 16 streams costs 15% more per stream), so extrapolating
+is fair:
+
+- **62 concurrent gated streams** (this box's observed peak) → **~1.1 cores**
+- **150 concurrent gated streams** (the brief's sizing target) → **~2.6 cores**
+
+**No sidecar needed.** `CPUQuota=400%` in the unit, not 260%, because that
+figure is ASR alone: the tap also decodes G.711 and parses every packet in
+Python, which at 150 streams is ~7,500 packets/second and has not been measured
+under load. `Nice=10` means Asterisk wins any contention regardless.
+
+Gated **streams** are not channels. Only the customer leg is transcribed, and
+only after it clears the RMS gate; most calls never reach a live agent.
+`tap.py --report` on live traffic gives the real ratio and it will be well
+under 1:1.
+
 ### What is still unmeasured
 
-- **Cores per concurrent ASR stream.** `asr.py --bench` on the box.
 - **Utterance → BYE latency.** Needs answered calls carrying audio.
 - **False-positive rate.** Five full traffic days in shadow mode.
+- **The tap's own CPU cost under load.** Bounded by the CPUQuota above.
 
 At the time of writing the trunk is live but every call rejects
 `CONGESTION` / `PORTAL_NO_FUNDS` before answer, so no call carries audio yet.

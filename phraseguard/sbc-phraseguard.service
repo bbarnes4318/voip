@@ -43,12 +43,34 @@ User=root
 # media on. Nice=10 means the kernel hands CPU to Asterisk first under
 # contention; CPUQuota is the hard ceiling on top of that.
 #
-# 200% = two cores. Size this from the MEASURED cores-per-stream figure that
-# phraseguard/asr.py --bench reports on this box, not from this default: the
-# right number is (peak concurrent gated streams x realtime factor), rounded
-# up, and it belongs in the deploy notes alongside the measurement.
+# MEASURED on this box, 2026-08-26, asr.py --bench against
+# vosk-model-small-en-us-0.15 with the corpus grammar:
+#
+#     1 stream   realtime factor 0.0150
+#     4 streams  realtime factor 0.0159
+#    16 streams  realtime factor 0.0172      <- use this one
+#
+# Realtime factor IS cores per concurrent stream: a stream produces audio in
+# real time, so RTF 0.017 keeps 1.7% of a core busy for as long as it runs.
+# Contention is mild -- 1 to 16 streams costs only 15% more per stream -- so
+# extrapolating is fair.
+#
+#    62 concurrent gated streams (this box's observed peak)  ~1.1 cores
+#   150 concurrent gated streams (the brief's sizing target) ~2.6 cores
+#
+# 400%, not 300%. The 2.6 figure is ASR alone. The tap decodes G.711 and parses
+# every packet in Python, and at 150 streams that is on the order of 7,500
+# packets a second -- a real cost that has NOT been measured under load yet.
+# Nice=10 means Asterisk still wins any contention regardless, so the headroom
+# costs nothing and a throttled detector that silently drops audio is a worse
+# failure than a generous ceiling.
+#
+# Note that gated STREAMS are not channels: only the customer leg is
+# transcribed, and only after it clears the RMS gate. Most calls never reach a
+# live agent. `tap.py --report` on live traffic gives the real ratio, and it
+# will be well under 1:1.
 Nice=10
-CPUQuota=200%
+CPUQuota=400%
 MemoryMax=2G
 # OOM-kill this before anything else on the box. A detector is not worth a
 # page fault in the media path.
