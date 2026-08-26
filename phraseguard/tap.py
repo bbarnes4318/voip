@@ -491,6 +491,7 @@ class RtpDemux(object):
         self.idle_timeout = idle_timeout
         self.streams = {}
         self.stats = collections.Counter()
+        self.other_sources = {}
         self._last_gc = 0.0
 
     def feed(self, ts, src, sport, dst, dport, payload, tracker=None):
@@ -523,6 +524,14 @@ class RtpDemux(object):
         if src not in self.media_ips:
             # The carrier leg and our own outbound. Counted, not decoded.
             self.stats["rtp_not_customer"] += 1
+            # Count by source so --report can say WHERE the audio is actually
+            # coming from. "0 customer streams" is useless on its own: the
+            # customer signalling from one address and sending media from
+            # another is a documented case on this box (PK_CLIENT_MEDIA_EXTRA
+            # in config.env exists for exactly it), and without this the two
+            # explanations -- wrong IP list, or no customer audio at all --
+            # look identical.
+            self.other_sources[src] = self.other_sources.get(src, 0) + 1
             return None
 
         cc = payload[0] & 0x0F
@@ -819,6 +828,26 @@ def _report(tap, elapsed=0.0):
     print()
     print("  THE NUMBER THAT SIZES THE ASR FLEET is 'streams past RMS gate'.")
     print("  Everything else is filtered before a recogniser is involved.")
+    # WHERE IS THE AUDIO COMING FROM. Without this, "customer streams 0" has
+    # two very different explanations that look identical: the customer is
+    # sending no audio, or the customer is sending audio from an address that
+    # is not in PK_CLIENT_IPS. config.env documents the second as a real case
+    # and PK_CLIENT_MEDIA_EXTRA is the fix for it.
+    if dm.other_sources:
+        print()
+        print("  RTP arriving from addresses NOT on the customer list")
+        print("  %-18s %10s" % ("source", "packets"))
+        for ip, n in sorted(dm.other_sources.items(), key=lambda kv: -kv[1])[:10]:
+            print("  %-18s %10d" % (ip, n))
+        if not dm.streams:
+            print()
+            print("  NO customer-leg audio was seen at all, but RTP IS flowing.")
+            print("  If one of the addresses above is the customer sending media")
+            print("  from a different address than it signals from, add it to")
+            print("  PK_CLIENT_MEDIA_EXTRA in config.env and restart. If they are")
+            print("  all carrier addresses, the customer genuinely sent no audio")
+            print("  in this window and there is nothing for a detector to hear.")
+
     if dm.stats["streams_unattributed"]:
         print()
         print("  WARNING: %d customer stream(s) could not be mapped to a Call-ID."

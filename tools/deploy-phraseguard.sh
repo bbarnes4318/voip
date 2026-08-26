@@ -554,10 +554,25 @@ else
 fi
 
 echo
-echo "  ${G}${B}PhraseGuard is installed and running in SHADOW MODE.${N}"
-echo
-echo "  It is watching calls and writing an evidence record. It is NOT"
-echo "  hanging up anything, and it will not until you change one setting."
+# READ THE ACTUAL MODE. This banner used to be hardcoded to "SHADOW MODE" and
+# printed that after an install where config.env said PHRASEGUARD_ENFORCE=1 and
+# the daemon's own preflight three lines earlier said ENFORCE. The one line in
+# this whole script that must never be wrong is the one saying whether calls
+# get disconnected, and it was wrong.
+if grep -qE '^[[:space:]]*PHRASEGUARD_ENFORCE[[:space:]]*=[[:space:]]*1' "$CONF" 2>/dev/null; then
+  echo "  ${R}${B}PhraseGuard is installed and ENFORCING.${N}"
+  echo
+  echo "  A confident Tier A match WILL DISCONNECT THE CALL."
+  echo
+  echo "  Turn it off instantly with:"
+  echo "    sed -i 's|^PHRASEGUARD_ENFORCE=.*|PHRASEGUARD_ENFORCE=0|' $CONF"
+  echo "    systemctl restart sbc-phraseguard"
+else
+  echo "  ${G}${B}PhraseGuard is installed and running in SHADOW MODE.${N}"
+  echo
+  echo "  It is watching calls and writing an evidence record. It is NOT"
+  echo "  hanging up anything, and it will not until you change one setting."
+fi
 echo
 echo "  ${B}What to do next${N}"
 echo "    1. Confirm it is alive:      $0 --check"
