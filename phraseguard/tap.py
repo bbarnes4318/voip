@@ -848,14 +848,38 @@ def _report(tap, elapsed=0.0):
             print("  all carrier addresses, the customer genuinely sent no audio")
             print("  in this window and there is nothing for a detector to hear.")
 
+    # UNATTRIBUTED has two causes that look identical in the count and have
+    # opposite severities, so the report has to separate them. Naming only the
+    # second one sent a live investigation at SDP correlation when the real
+    # answer was the length of the capture window.
     if dm.stats["streams_unattributed"]:
+        orphan = tr.stats["sip_orphan"]
         print()
-        print("  WARNING: %d customer stream(s) could not be mapped to a Call-ID."
+        print("  %d customer stream(s) could not be mapped to a Call-ID."
               % dm.stats["streams_unattributed"])
         print("  Those can be transcribed but NOT acted on -- with no Call-ID")
-        print("  there is no channel to hang up and no call to attribute. If")
-        print("  this is more than a rounding error, the SDP correlation needs")
-        print("  looking at before enforcement is considered.")
+        print("  there is no channel to hang up and no call to attribute.")
+        print()
+        print("  mid-dialog SIP for calls with no INVITE seen   %d" % orphan)
+        if orphan:
+            print()
+            print("  Those calls were already up when this capture attached, so")
+            print("  their INVITE and its SDP are in the past. feed() refuses to")
+            print("  invent a call without one -- a CallInfo with no customer IP,")
+            print("  no ANI and no DNIS is exactly the record that is useless")
+            print("  later. They can NEVER be attributed, by design.")
+            print()
+            print("  In a short run that is the expected cause and it says")
+            print("  nothing about SDP correlation. The daemon runs continuously")
+            print("  and sees the INVITE for every call that STARTS after it")
+            print("  does, so this shrinks to the first call-duration after a")
+            print("  restart. To confirm: re-run longer. The unattributed")
+            print("  fraction should fall roughly as 1/duration.")
+        else:
+            print()
+            print("  No orphaned mid-dialog SIP, so the window edge does NOT")
+            print("  explain these. THIS is the case where SDP correlation is")
+            print("  the problem and needs looking at before enforcement.")
     if dm.streams:
         print()
         print("  %-46s %7s %8s %6s" % ("stream", "pkts", "mean_rms", "gate"))

@@ -212,6 +212,56 @@ st = list(d.streams.values())[0]
 sys.exit(0 if st.call_id == "abc@floor" else 1)
 PY
 
+# REGRESSION: UNATTRIBUTED has two causes with opposite severities. A call
+# already up when the capture attached has its INVITE in the past and can never
+# be attributed -- expected, and the dominant cause in any short run. A stream
+# unattributed with NO orphaned mid-dialog SIP is broken SDP correlation. The
+# report named only the second, which sent a live investigation at correlation
+# when the real answer was a 60-second window.
+python3 - "$PG" <<'PY' && ok "the report tells window-edge apart from broken correlation" \
+    || bad "the report tells window-edge apart from broken correlation"
+import contextlib, io, sys
+sys.path.insert(0, sys.argv[1])
+from tap import RtpDemux, SipTracker, _report
+
+tr = SipTracker(["1.2.3.4"])
+bye = (b"BYE sip:x@5.6.7.8 SIP/2.0\r\nCall-ID: no-invite-here@floor\r\n"
+       b"From: <sip:15551234567@1.2.3.4>\r\n\r\n")
+tr.feed(1000.0, "1.2.3.4", 5060, "5.6.7.8", 5060, bye)
+assert tr.stats["sip_orphan"] == 1, "mid-dialog with no INVITE was not counted"
+assert not tr.calls, "a call was invented without an INVITE"
+
+dm = RtpDemux(["1.2.3.4"])
+dm.stats["streams_unattributed"] = 4
+
+class FakeTap:
+    pcap_path = None
+    iface = "any"
+    def __init__(self, tracker):
+        self.tracker, self.demux = tracker, dm
+        self.stats = {"packets": 1, "sip": 1, "rtp": 0}
+    def bpf(self):
+        return "udp"
+
+def render(tracker):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _report(FakeTap(tracker), 60.0)
+    return buf.getvalue()
+
+WINDOW = "can NEVER be attributed, by design"
+BROKEN = "the window edge does NOT"
+
+out = render(tr)
+assert WINDOW in out, "orphans present but the window edge was not named"
+assert BROKEN not in out, "accused SDP correlation while orphans explain it"
+assert "mid-dialog SIP for calls with no INVITE seen   1" in out, "orphan count not shown"
+
+out = render(SipTracker(["1.2.3.4"]))
+assert BROKEN in out, "no orphans, but broken correlation was not named"
+assert WINDOW not in out, "named the window edge with no orphans to support it"
+PY
+
 # ---------------------------------------------------------------------------
 head_ "4b. the 8 kHz -> 16 kHz rate bridge"
 # REGRESSION: every general-purpose Vosk English model is 16 kHz and this trunk
