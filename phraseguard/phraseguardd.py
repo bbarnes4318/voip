@@ -93,7 +93,7 @@ class Config(object):
         self.model = e.get("PHRASEGUARD_VOSK_MODEL") or ""
 
         self.gate_rms = float(e.get("PHRASEGUARD_GATE_RMS") or 200.0)
-        self.gate_seconds = float(e.get("PHRASEGUARD_GATE_SECONDS") or 5.0)
+        self.gate_seconds = float(e.get("PHRASEGUARD_GATE_SECONDS") or 2.5)
         self.window_s = float(e.get("PHRASEGUARD_B_WINDOW_S") or 90.0)
         self.context_words = int(e.get("PHRASEGUARD_CONTEXT_WORDS") or 10)
 

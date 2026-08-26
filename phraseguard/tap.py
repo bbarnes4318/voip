@@ -482,7 +482,7 @@ class RtpDemux(object):
     can differ and the firewall already treats them as separate lists.
     """
 
-    def __init__(self, media_ips, gate_rms=200.0, gate_seconds=5.0,
+    def __init__(self, media_ips, gate_rms=200.0, gate_seconds=2.5,
                  ring_seconds=10.0, idle_timeout=30.0):
         self.media_ips = frozenset(media_ips)
         self.gate_rms = gate_rms
@@ -903,7 +903,7 @@ def main(argv=None):
     ap.add_argument("--rtp-lo", type=int, default=int(os.environ.get("RTP_START", 10000)))
     ap.add_argument("--rtp-hi", type=int, default=int(os.environ.get("RTP_END", 20000)))
     ap.add_argument("--gate-rms", type=float, default=200.0)
-    ap.add_argument("--gate-seconds", type=float, default=5.0)
+    ap.add_argument("--gate-seconds", type=float, default=2.5)
     ap.add_argument("--seconds", type=int, default=60, help="0 = until EOF/Ctrl-C")
     ap.add_argument("--report", action="store_true")
     a = ap.parse_args(argv)
