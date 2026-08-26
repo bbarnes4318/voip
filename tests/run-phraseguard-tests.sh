@@ -143,7 +143,10 @@ CUST=116.202.146.131
 python3 "$GEN" "$WORK/speech.pcap" --voiced-seconds 12 >/dev/null 2>&1
 python3 "$GEN" "$WORK/comfort.pcap" --kind comfort >/dev/null 2>&1
 python3 "$GEN" "$WORK/silence.pcap" --kind silence >/dev/null 2>&1
-python3 "$GEN" "$WORK/short.pcap" --voiced-seconds 3 >/dev/null 2>&1
+# Shorter than the gate. 1s, not 3s: the gate default dropped from 5s to 2.5s
+# after live traffic showed a real agent speaking for 4.3s being rejected, and
+# a 3s fixture correctly opens a 2.5s gate.
+python3 "$GEN" "$WORK/short.pcap" --voiced-seconds 1 >/dev/null 2>&1
 
 tap() { python3 "$PG/tap.py" --pcap "$1" --customer-ips "$CUST" --report; }
 
@@ -156,6 +159,13 @@ expect "comfort noise does NOT open the gate" "gate opened         0" tap "$WORK
 expect "silence does NOT open the gate" "gate opened         0" tap "$WORK/silence.pcap"
 expect "speech shorter than the gate window does NOT open it" \
        "gate opened         0" tap "$WORK/short.pcap"
+
+# REGRESSION: the gate must admit a real agent. Measured on live traffic
+# 2026-08-26 -- 216 packets at mean RMS 1866, i.e. 4.32 seconds of speech --
+# and the 5-second gate then in force rejected it by seven tenths of a second.
+python3 "$GEN" "$WORK/agent.pcap" --voiced-seconds 4.32 >/dev/null 2>&1
+expect "4.3s of real agent speech OPENS the gate" \
+       "gate opened         1" tap "$WORK/agent.pcap"
 
 # REGRESSION: streams that never open their gate must still be expired. The
 # GC sweep used to sit at the END of feed(), after every early return, so it
