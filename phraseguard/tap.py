@@ -133,11 +133,33 @@ def _read_exact(fh, n):
     return buf
 
 
+class CaptureFailed(PcapError):
+    """The capture never produced a pcap header -- tcpdump did not start."""
+
+
+def _chain_first(first, rest):
+    """Yield a packet already pulled off a generator, then the remainder.
+
+    Tap.run has to consume one packet to tell "tcpdump started and is waiting
+    for traffic" from "tcpdump died", and that packet still has to be
+    processed. On a quiet trunk this blocks until the first packet arrives,
+    which is correct: a tap with nothing to read is not a failure.
+    """
+    yield first
+    for pkt in rest:
+        yield pkt
+
+
 def read_pcap_stream(fh):
     """Yield (ts, src, sport, dst, dport, payload) for every UDP packet."""
     gh = _read_exact(fh, 24)
     if gh is None:
-        return
+        # EOF before even the 24-byte global header. tcpdump exited instead of
+        # capturing. Returning quietly here made the daemon look like a clean
+        # end-of-capture: it logged start, then stop, exited 0, and systemd
+        # reported "Deactivated successfully" with nothing anywhere saying why.
+        # A capture that never started is a startup failure and has to say so.
+        raise CaptureFailed("capture produced no pcap header")
     magic = struct.unpack("<I", gh[:4])[0]
     if magic == 0xA1B2C3D4:
         e = "<"
@@ -605,15 +627,35 @@ class Tap(object):
     def _open(self):
         if self.pcap_path:
             return open(self.pcap_path, "rb"), None
+        # -Z root: Ubuntu's tcpdump drops privileges to the "tcpdump" user and
+        # chroots to /var/lib/tcpdump as soon as the capture socket is open.
+        # Under this unit's ProtectSystem=strict sandbox that directory is not
+        # writable, so tcpdump exits immediately and the daemon sees an empty
+        # stream. We are already root and staying root is what the capture
+        # needs; -Z root tells it not to try.
         cmd = ["tcpdump", "-i", self.iface, "-nn", "-s", str(self.snaplen),
-               "-U", "-w", "-", self.bpf()]
+               "-U", "-Z", "root", "-w", "-", self.bpf()]
         # -w - is stdout, a PIPE. There is no filesystem path in this command
         # and there must never be one: the no-audio-retention rule is enforced
         # by there being nowhere for audio to land, not by remembering to
         # delete it afterwards.
+        # Keep stderr. Discarding it is why a failed capture was undiagnosable:
+        # tcpdump explains itself perfectly well on stderr and we were throwing
+        # that away, leaving "started, then stopped" and nothing else.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=0)
+                                stderr=subprocess.PIPE, bufsize=0)
         return proc.stdout, proc
+
+    def capture_error(self):
+        """Whatever tcpdump said before it died, trimmed to one line."""
+        if self.proc is None or self.proc.stderr is None:
+            return ""
+        try:
+            err = self.proc.stderr.read(4096).decode("utf-8", "replace")
+        except Exception:                              # noqa: BLE001
+            return ""
+        lines = [l.strip() for l in err.split("\n") if l.strip()]
+        return "; ".join(lines[:3])
 
     def run(self, on_audio=None, on_packet=None, stop=None):
         """Read until EOF or `stop()` returns True.
@@ -625,7 +667,21 @@ class Tap(object):
         fh, proc = self._open()
         self.proc = proc
         try:
-            for pkt in read_pcap_stream(fh):
+            try:
+                stream = read_pcap_stream(fh)
+                first = next(stream, None)
+            except CaptureFailed as e:
+                # Re-raise naming what tcpdump actually said. This is the
+                # difference between "the detector is not running and here is
+                # the one line explaining why" and a unit that exits 0.
+                detail = self.capture_error()
+                raise CaptureFailed(
+                    "%s. tcpdump: %s" % (e, detail or "(no output on stderr)"))
+            if first is None:
+                raise CaptureFailed(
+                    "capture ended immediately. tcpdump: %s"
+                    % (self.capture_error() or "(no output on stderr)"))
+            for pkt in _chain_first(first, stream):
                 if stop is not None and stop():
                     break
                 ts, src, sport, dst, dport, payload = pkt

@@ -48,7 +48,7 @@ from actuator import (AsteriskCLI, ChannelResolver, ChannelTable,  # noqa: E402
 from asr import RecognizerFactory, load_script                     # noqa: E402
 from matcher import BScorer, CallWindow, Corpus, Matcher, Thresholds  # noqa: E402
 from record import CustomerCounters, Recorder, health              # noqa: E402
-from tap import RtpDemux, SipTracker, Tap                          # noqa: E402
+from tap import CaptureFailed, RtpDemux, SipTracker, Tap           # noqa: E402
 
 DEFAULT_LOCK = "/run/phraseguard.pid"
 
@@ -402,6 +402,19 @@ class PhraseGuard(object):
                          stop=self._stop_check)
         except KeyboardInterrupt:
             pass
+        except CaptureFailed as e:
+            # The capture never started. Distinguished from a tap that ran and
+            # then died because the operator fix is different -- and because
+            # this used to exit 0, which systemd reported as
+            # "Deactivated successfully" with no clue anywhere.
+            self.recorder.event("fatal", level="crit", detail=str(e),
+                                action="capture_failed")
+            health("crit", "PhraseGuard could not start its capture: %s. Calls "
+                           "are UNAFFECTED; detection is off. Check that "
+                           "tcpdump runs as root on this interface." % e)
+            sys.stderr.write("\n  CAPTURE FAILED: %s\n" % e)
+            self.shutdown()
+            return 1
         except Exception as e:                         # noqa: BLE001
             # Fail open, loudly. The tap dying must be visible, and must not
             # be the last thing this process does silently.

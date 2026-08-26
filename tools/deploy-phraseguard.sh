@@ -330,22 +330,50 @@ else
   if (( DRY )); then
     printf '  %s[dry-run]%s would download %s into %s\n' "$D" "$N" "$MODEL_NAME" "$MODEL_DIR"
   else
+    # Install the fetch tools if they are missing. A hardened SBC often has
+    # neither curl nor unzip, and "could not fetch the model" without saying
+    # WHICH piece was missing sent the first real install away with detection
+    # silently disabled.
+    MISSING=""
+    for t in curl unzip; do command -v "$t" >/dev/null || MISSING+=" $t"; done
+    if [[ -n "$MISSING" ]]; then
+      say "missing:$MISSING — installing"
+      apt-get update -qq >/dev/null 2>&1
+      # shellcheck disable=SC2086
+      apt-get install -y -qq $MISSING >/dev/null 2>&1
+      for t in $MISSING; do
+        command -v "$t" >/dev/null && ok "installed $t" || bad "could not install $t"
+      done
+    fi
+
     say "downloading $MODEL_NAME (~40MB) into $MODEL_DIR"
     mkdir -p "$MODEL_DIR"
-    if command -v unzip >/dev/null && \
-       curl -fsSL --retry 3 -o "$MODEL_DIR/model.zip" "$MODEL_URL" && \
-       unzip -q -o "$MODEL_DIR/model.zip" -d "$MODEL_DIR"; then
-      rm -f "$MODEL_DIR/model.zip"
+    DL_ERR=""
+    if ! command -v curl >/dev/null; then
+      DL_ERR="curl is not installed and could not be installed"
+    elif ! DL_ERR="$(curl -fsSL --retry 3 --max-time 300 \
+                     -o "$MODEL_DIR/model.zip" "$MODEL_URL" 2>&1)"; then
+      DL_ERR="${DL_ERR:-curl failed (network egress blocked?)}"
+    elif ! command -v unzip >/dev/null; then
+      DL_ERR="downloaded, but unzip is not available to extract it"
+    elif ! DL_ERR="$(unzip -q -o "$MODEL_DIR/model.zip" -d "$MODEL_DIR" 2>&1)"; then
+      DL_ERR="${DL_ERR:-unzip failed}"
+    else
+      DL_ERR=""
+    fi
+    rm -f "$MODEL_DIR/model.zip"
+
+    if [[ -z "$DL_ERR" && -d "$MODEL_PATH" ]]; then
       ok "model installed at $MODEL_PATH"
     else
-      rm -f "$MODEL_DIR/model.zip"
-      warn "could not fetch the model automatically"
+      warn "could not fetch the model: ${DL_ERR:-unknown}"
       say "${D}PhraseGuard will still install and run, recording calls and${N}"
       say "${D}per-customer counters, but it will not transcribe anything.${N}"
-      say "${D}Fetch it by hand on any machine and copy it over:${N}"
+      say "${D}Fetch it on any machine with internet and copy it over:${N}"
       say "${D}  curl -LO $MODEL_URL${N}"
-      say "${D}  unzip $MODEL_NAME.zip -d $MODEL_DIR${N}"
-      say "${D}then re-run with --model $MODEL_DIR/$MODEL_NAME${N}"
+      say "${D}  scp $MODEL_NAME.zip root@THIS-BOX:/opt/vosk/${N}"
+      say "${D}  ssh root@THIS-BOX 'cd /opt/vosk && unzip $MODEL_NAME.zip'${N}"
+      say "${D}then re-run: $0 --install --model $MODEL_DIR/$MODEL_NAME${N}"
       MODEL_PATH=""
     fi
   fi
@@ -359,12 +387,27 @@ elif (( DRY )); then
   printf '  %s[dry-run]%s would pip install vosk\n' "$D" "$N"
 else
   say "installing the vosk python module"
-  if python3 -m pip install --quiet vosk 2>/dev/null \
-     || python3 -m pip install --quiet --break-system-packages vosk 2>/dev/null; then
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    say "pip is not present — installing python3-pip"
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq python3-pip >/dev/null 2>&1
+    python3 -m pip --version >/dev/null 2>&1 \
+      && ok "pip installed" || bad "could not install python3-pip"
+  fi
+  # --break-system-packages is needed on Ubuntu 24.04 (PEP 668). Try the plain
+  # form first so we do not use it where it is unnecessary, and KEEP the error
+  # from the second attempt -- discarding it is what turned a fixable problem
+  # into "could not install vosk" with no reason attached.
+  PIP_ERR=""
+  if python3 -m pip install --quiet vosk >/dev/null 2>&1; then
     ok "vosk installed"
+  elif PIP_ERR="$(python3 -m pip install --quiet --break-system-packages vosk 2>&1)"; then
+    ok "vosk installed (--break-system-packages)"
   else
-    warn "could not install vosk — PhraseGuard runs with detection disabled"
-    say "${D}apt-get install -y python3-pip && python3 -m pip install vosk${N}"
+    warn "could not install vosk — PhraseGuard runs with DETECTION DISABLED"
+    say "${D}$(head -3 <<< "${PIP_ERR:-no output from pip}")${N}"
+    say "${D}The tap, call correlation and per-customer counters still work.${N}"
+    say "${D}Nothing about calls is affected either way.${N}"
   fi
 fi
 

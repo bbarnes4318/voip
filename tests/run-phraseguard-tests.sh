@@ -275,6 +275,40 @@ expect "an empty PK_CLIENT_IPS is REFUSED" "REFUSING" \
     env PK_CLIENT_IPS= PHRASEGUARD_LOG_DIR="$WORK/logs" \
         python3 "$PG/phraseguardd.py" --self-test
 
+# REGRESSION: a capture that never starts must be a LOUD FAILURE.
+# Reported from the first real install: tcpdump died instantly, the tap read an
+# empty stream, treated it as a clean end-of-capture, logged start then stop and
+# exited 0 -- so systemd said "Deactivated successfully" and nothing anywhere
+# said why. tcpdump's stderr was being discarded, so there was nothing to read.
+mkdir -p "$WORK/shim"
+cat > "$WORK/shim/tcpdump" <<'SH'
+#!/bin/bash
+echo "tcpdump: Couldn't change to 'tcpdump' uid=123 gid=123: Permission denied" >&2
+exit 1
+SH
+chmod +x "$WORK/shim/tcpdump"
+rm -rf "$WORK/deadlogs"; mkdir -p "$WORK/deadlogs"
+out="$(PATH="$WORK/shim:$PATH" PK_CLIENT_IPS="$CUST" \
+       PHRASEGUARD_LOG_DIR="$WORK/deadlogs" PHRASEGUARD_STATE="$WORK/dead.json" \
+       PHRASEGUARD_MANAGER_CONF="$ROOT/asterisk/manager.conf.tpl" \
+       python3 "$PG/phraseguardd.py" --lock "$WORK/dead.pid" 2>&1)"
+rc=$?
+if [[ "$rc" != 0 ]]; then ok "a capture that never starts exits NON-ZERO"
+else bad "a capture that never starts exits NON-ZERO" "exited 0 -- systemd would call this success"; fi
+if grep -qF "CAPTURE FAILED" <<< "$out"; then ok "the failure says CAPTURE FAILED"
+else bad "the failure says CAPTURE FAILED" "$out"; fi
+if grep -qF "Permission denied" <<< "$out"; then
+  ok "tcpdump's own stderr is surfaced, not discarded"
+else bad "tcpdump's own stderr is surfaced, not discarded" "$out"; fi
+if grep -qF '"event": "fatal"' "$WORK"/deadlogs/*.jsonl 2>/dev/null; then
+  ok "the capture failure is recorded in the evidence log"
+else bad "the capture failure is recorded in the evidence log"; fi
+
+# And the flag that stops it happening again on Ubuntu.
+if grep -qF '"-Z", "root"' "$PG/tap.py"; then
+  ok "tcpdump is told not to drop privileges (-Z root)"
+else bad "tcpdump is told not to drop privileges (-Z root)"; fi
+
 # ---------------------------------------------------------------------------
 head_ "7. AMI and the actuator"
 expect "the AMI probe reads manager.conf rather than assuming" "disabled" \
