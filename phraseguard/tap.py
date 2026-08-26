@@ -811,13 +811,37 @@ def _report(tap, elapsed=0.0):
     print()
 
 
+def _read_config(path):
+    """KEY=VALUE out of a config.env. Never executes it, never raises.
+
+    Deliberately not a shell source: config.env holds live credentials on a
+    border element and a diagnostic has no business executing it.
+    """
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--pcap", help="replay a saved capture instead of tapping live")
     ap.add_argument("--iface", default="any")
-    ap.add_argument("--customer-ips", default=os.environ.get("PK_CLIENT_IPS", ""),
-                    help="comma-separated; defaults to $PK_CLIENT_IPS")
+    ap.add_argument("--customer-ips", default="",
+                    help="comma-separated; defaults to PK_CLIENT_IPS from the "
+                         "environment or from --config")
+    ap.add_argument("--config", default="/opt/sbc/config.env",
+                    help="config.env to read PK_CLIENT_IPS and the RTP range "
+                         "from when they are not in the environment")
     ap.add_argument("--media-extra", default=os.environ.get("PK_CLIENT_MEDIA_EXTRA", ""))
     ap.add_argument("--rtp-lo", type=int, default=int(os.environ.get("RTP_START", 10000)))
     ap.add_argument("--rtp-hi", type=int, default=int(os.environ.get("RTP_END", 20000)))
@@ -826,6 +850,24 @@ def main(argv=None):
     ap.add_argument("--seconds", type=int, default=60, help="0 = until EOF/Ctrl-C")
     ap.add_argument("--report", action="store_true")
     a = ap.parse_args(argv)
+
+    # config.env is where every other script on this box gets these. Requiring
+    # the operator to retype three IP addresses to run a diagnostic is how a
+    # diagnostic stops being run -- the first live attempt at --report died on
+    # exactly that.
+    cfg = _read_config(a.config)
+    if not a.customer_ips:
+        a.customer_ips = os.environ.get("PK_CLIENT_IPS") or cfg.get("PK_CLIENT_IPS", "")
+    if not a.media_extra:
+        a.media_extra = (os.environ.get("PK_CLIENT_MEDIA_EXTRA")
+                         or cfg.get("PK_CLIENT_MEDIA_EXTRA", ""))
+    for name, attr, default in (("RTP_START", "rtp_lo", 10000),
+                                ("RTP_END", "rtp_hi", 20000)):
+        if getattr(a, attr) == default and cfg.get(name):
+            try:
+                setattr(a, attr, int(cfg[name]))
+            except ValueError:
+                pass
 
     cust = [x.strip() for x in a.customer_ips.replace(",", " ").split() if x.strip()]
     if not cust:
