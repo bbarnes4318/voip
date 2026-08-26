@@ -160,7 +160,11 @@ mkdir -p '$RemoteStage'
 tar xzf /tmp/phraseguard-deploy.tar.gz -C '$RemoteStage'
 rm -f /tmp/phraseguard-deploy.tar.gz
 cd '$RemoteStage'
-sudo bash ./tools/deploy-phraseguard.sh $ActionFlag $Extra
+# sudo only when not already root. Connecting as root@ is the normal case on
+# this box, and a minimal Hetzner image often has no sudo at all -- hardcoding
+# it turns a working login into "sudo: command not found".
+if [ "`$(id -u)" = 0 ]; then SUDO=; elif command -v sudo >/dev/null; then SUDO=sudo; else echo 'not root and no sudo on this box' >&2; exit 2; fi
+`$SUDO bash ./tools/deploy-phraseguard.sh $ActionFlag $Extra
 rc=`$?
 rm -rf '$RemoteStage'
 exit `$rc

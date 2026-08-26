@@ -149,8 +149,12 @@ if [[ -n "$REMOTE" ]]; then
   # -t for a tty: sudo may need to prompt, and the deploy prints progress the
   # operator should watch. The staging directory is removed whether the deploy
   # succeeded or not.
+  # sudo only when we are not already root. Connecting as root@ is the normal
+  # case on this box, and a minimal Hetzner image frequently has no sudo
+  # installed at all -- hardcoding it turns a working login into
+  # "sudo: command not found".
   ssh -t -o ConnectTimeout=15 "$REMOTE" \
-      "cd '$STAGE' && sudo bash ./tools/deploy-phraseguard.sh$REMOTE_ARGS; rc=\$?; rm -rf '$STAGE'; exit \$rc"
+      "cd '$STAGE' && if [ \"\$(id -u)\" = 0 ]; then SUDO=; elif command -v sudo >/dev/null; then SUDO=sudo; else echo 'not root and no sudo on this box' >&2; exit 2; fi; \$SUDO bash ./tools/deploy-phraseguard.sh$REMOTE_ARGS; rc=\$?; rm -rf '$STAGE'; exit \$rc"
   rc=$?
   echo
   if (( rc == 0 )); then
