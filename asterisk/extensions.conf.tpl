@@ -69,6 +69,9 @@ clearglobalvars=no
 [globals]
 SBC_MAX_CONCURRENT=@@MAX_CONCURRENT_PER_IP@@
 SBC_MAX_CPS=@@MAX_CPS@@
+; Per-gateway CPS. FracTEL grants this PER PROXY IP, so it is a separate
+; ceiling from SBC_MAX_CPS and not a division of it.
+SBC_MAX_CPS_GW=@@MAX_CPS_PER_GW@@
 SBC_NANP_ONLY=@@NANP_ONLY@@
 SBC_BLOCK_NPA=@@BLOCK_HIGH_RISK_NPA@@
 SBC_BLOCK_976=@@BLOCK_976@@
@@ -99,8 +102,10 @@ SBC_XFER_MIN_ACD=@@TRANSFER_MIN_ACD@@
 ; The dialplan reads ${GLOBAL(SBC_DID_POOL_${SBC_NPA})}, so an NPA with no
 ; pool of its own yields an empty string and falls straight to OVERFLOW.
 ;
-; @@DID_TOTAL@@ number(s) across @@DID_NPA_POOLS@@ NPA pool(s), plus
-; @@OVERFLOW_COUNT@@ in overflow. Daily cap @@DID_DAILY_CAP@@ per DID.
+; @@DID_DISTINCT@@ distinct number(s), placed @@DID_PLACEMENTS@@ time(s) across
+; @@DID_NPA_POOLS@@ NPA pool(s) and @@OVERFLOW_COUNT@@ in overflow. Daily cap
+; @@DID_DAILY_CAP@@ per NUMBER, not per placement: a number in three pools
+; still has one budget, so fleet capacity is @@DID_DISTINCT@@ x @@DID_DAILY_CAP@@.
 @@INCLUDE:did_globals@@
 
 ; SBC_KILLSWITCH is deliberately NOT declared here. killswitch.sh sets it at
@@ -243,6 +248,20 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  ; still obeys the daily cap.
  same => n,ExecIf($["${SBC_NPA}" = ""]?Set(SBC_NPA=${SBC_DEST:1:3}))
  same => n,Set(CDR(destination_npa)=${SBC_NPA})
+
+ ; ---- portal verdicts: funds and calling hours ---------------------------
+ ; Read from AstDB, written by portal-sync.timer from outside Asterisk. No
+ ; network and no shell on the call path. Absent or stale data means ALLOW.
+ same => n,Set(SBC_PSYNC=${DB(portal/meta/synced_at)})
+ same => n,GotoIf($["${SBC_PSYNC}" = ""]?portal_ok)
+ same => n,GotoIf($[${EPOCH} - ${SBC_PSYNC} > 300]?portal_stale)
+ same => n,GotoIf($["${DB(portal/blocked/${SBC_EP})}" = "1"]?rej_portal_funds)
+ same => n,GotoIf($["${DB(portal/blocked/${SBC_SRC_IP})}" = "1"]?rej_portal_funds)
+ same => n,GotoIf($["${DB(portal/ch_enforced/${SBC_EP})}" != "1"]?portal_ok)
+ same => n,GotoIf($["${DB(portal/closed_npa/${SBC_NPA})}" = "1"]?rej_portal_hours)
+ same => n,Goto(portal_ok)
+ same => n(portal_stale),Log(WARNING,SBC-PORTAL-STALE age=$[${EPOCH} - ${SBC_PSYNC}] callid=${SBC_CALLID} note=portal-sync-not-running-allowing-call)
+ same => n(portal_ok),NoOp(portal checks complete)
 
  ; ---- 3. high-cost LRN prefix blocklist ----------------------------------
  ; [sbc-lrn-blocklist] is generated from blocklist.csv, one extension per
@@ -400,14 +419,14 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  same => n(xfer_no),Set(SBC_DID=)
  same => n,Set(SBC_DID_COUNT=)
  same => n,Set(SBC_DID_REASON=npa_match)
- same => n,Gosub(sbc-did,pick,1(${SBC_NPA},${GLOBAL(SBC_DID_POOL_${SBC_NPA})},${GLOBAL(SBC_DID_CNT_${SBC_NPA})}))
+ same => n,Gosub(sbc-did,pick,1(${SBC_NPA},${GLOBAL(SBC_DID_CNT_${SBC_NPA})}))
  same => n,GotoIf($["${SBC_DID}" != ""]?did_ok)
 
  ; Either this NPA has no pool of its own, or every DID in it is capped out
  ; for the day. Overflow obeys the same cap; there is no unmetered fallback
  ; anywhere in this path, and no single default number.
  same => n,Set(SBC_DID_REASON=overflow)
- same => n,Gosub(sbc-did,pick,1(OVERFLOW,${GLOBAL(SBC_DID_POOL_OVERFLOW)},${GLOBAL(SBC_DID_CNT_OVERFLOW)}))
+ same => n,Gosub(sbc-did,pick,1(OVERFLOW,${GLOBAL(SBC_DID_CNT_OVERFLOW)}))
  same => n,GotoIf($["${SBC_DID}" = ""]?rej_nodid)
  same => n,Log(WARNING,SBC-DID-OVERFLOW callid=${SBC_CALLID} dst_npa=${SBC_NPA} dst=${SBC_DEST} did=${SBC_DID} count=${SBC_DID_COUNT} cap=${SBC_DID_CAP} note=no-pool-or-pool-exhausted)
 
@@ -452,8 +471,40 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  same => n,Set(SBC_GWROT=$[${IF($["${GLOBAL(SBC_GW_ROT)}" != ""]?${GLOBAL(SBC_GW_ROT)}:0)} + 1])
  same => n,Set(GLOBAL(SBC_GW_ROT)=${SBC_GWROT})
  same => n,Set(SBC_GWIDX=$[( ${SBC_GWROT} % ${SBC_GW_COUNT} ) + 1])
+ same => n,Set(SBC_GWSKIP=0)
 
  same => n(gwloop),Set(SBC_GW=${GLOBAL(FRACTEL_GW_${SBC_GWIDX})})
+
+ ; --- per-gateway CPS ------------------------------------------------------
+ ; FracTEL grants 50 CPS PER GATEWAY IP, not 50 shared. The global GROUP(cps)
+ ; check above cannot express that: it counts every call in the second
+ ; regardless of which gateway it is headed for, so a box inside the global
+ ; ceiling can still put 300 calls a second onto one proxy and collect 503s.
+ ;
+ ; Category gwcps, keyed on gateway AND epoch second. Underscore, not '@' --
+ ; GROUP_COUNT parses name@category, so an '@' inside the name would split in
+ ; the wrong place.
+ ;
+ ; A gateway at its limit is SKIPPED, not refused. The grant is per IP, so a
+ ; busy proxy says nothing about the other five, and the rotor has already
+ ; spread load evenly (measured 2026-08-21: 19.6-20.3% per gateway, peak 13-18
+ ; CPS each against the 50 grant, so this should essentially never fire).
+ ;
+ ; Skipping deliberately does NOT touch SBC_TRY. SBC_TRY counts INVITEs sent,
+ ; and no INVITE is sent here -- burning an attempt on a gateway we declined to
+ ; use would refuse calls that had five good gateways available. The loop is
+ ; bounded by SBC_GWSKIP against the gateway count, so an all-busy ring exits
+ ; to rej_cps rather than spinning.
+ same => n,Set(GROUP(gwcps)=${SBC_GW}_${SBC_SEC})
+ same => n,Set(SBC_GWCPS=${GROUP_COUNT(${SBC_GW}_${SBC_SEC}@gwcps)})
+ same => n,GotoIf($[${SBC_GWCPS} <= ${SBC_MAX_CPS_GW}]?gwok)
+ same => n,Set(SBC_GWSKIP=$[${SBC_GWSKIP} + 1])
+ same => n,Log(NOTICE,SBC-GW-CPS-SKIP callid=${SBC_CALLID} gw=${SBC_GW} gwcps=${SBC_GWCPS} cap=${SBC_MAX_CPS_GW} skipped=${SBC_GWSKIP})
+ same => n,GotoIf($[${SBC_GWSKIP} >= ${SBC_GW_COUNT}]?rej_cps)
+ same => n,Set(SBC_GWIDX=$[( ${SBC_GWIDX} % ${SBC_GW_COUNT} ) + 1])
+ same => n,Goto(gwloop)
+
+ same => n(gwok),NoOp(gateway ${SBC_GW} within its ${SBC_MAX_CPS_GW} CPS grant at ${SBC_GWCPS})
  same => n,Set(CDR(fractel_gateway_used)=${SBC_GW})
  same => n,Log(NOTICE,SBC-DIAL callid=${SBC_CALLID} src=${SBC_SRC_IP} ep=${SBC_EP} custcid=${SBC_CID_RAW} did=${SBC_DID} didreason=${SBC_DID_REASON} didcount=${SBC_DID_COUNT} xfer=${SBC_XFER} asserted=${CALLERID(num)} dst=${SBC_DEST} gw=${SBC_GW} attempt=${SBC_TRY} maxattempts=${SBC_MAX_ATTEMPTS})
 
@@ -587,6 +638,10 @@ exten => _X.,1,NoOp(SBC inbound raw=${EXTEN} cid=${CALLERID(num)} ep=${CHANNEL(e
  same => n,Goto(reject503)
  same => n(rej_exhausted),Set(SBC_REJ=ALL_GATEWAYS_FAILED)
  same => n,Goto(reject503)
+ same => n(rej_portal_funds),Set(SBC_REJ=PORTAL_NO_FUNDS)
+ same => n,Goto(reject503)
+ same => n(rej_portal_hours),Set(SBC_REJ=PORTAL_CALLING_HOURS)
+ same => n,Goto(reject503)
 
  ; ---- high-cost prefix ---------------------------------------------------
  ; WARN, not NOTICE: this is money. The rate and label come straight from the
@@ -701,7 +756,13 @@ exten => h,1,Set(CDR(hangup_cause)=${IF($["${SBC_CAUSE}" != ""]?${SBC_CAUSE}:${H
 ; Gosub'd from [sbc-customer]. Not reachable from a channel: no endpoint has
 ; this as its context, and there is no include anywhere in this file.
 ;
-;   Gosub(sbc-did,pick,1(<poolkey>,<pipe-delimited pool>,<count>))
+;   Gosub(sbc-did,pick,1(<poolkey>,<count>))
+;
+; The pool itself is NOT passed. Members are read one at a time from
+; SBC_DID_P_<key>_<idx>, so no long string is ever expanded and the 4096-byte
+; argument buffer cannot apply at any pool size. Passing the list is what
+; truncated OVERFLOW at member 341 and asserted the fragment "173" as caller
+; ID on 2026-08-21.
 ;
 ; Sets, on return:
 ;   SBC_DID        the number to assert, or EMPTY if the whole pool is capped
@@ -748,10 +809,14 @@ exten => h,1,Set(CDR(hangup_cause)=${IF($["${SBC_CAUSE}" != ""]?${SBC_CAUSE}:${H
 exten => pick,1,Set(SBC_DID=)
  same => n,Set(SBC_DID_COUNT=)
  same => n,Set(SBC_P_KEY=${ARG1})
- same => n,Set(SBC_P_LIST=${ARG2})
+ ; Walk counter, initialised here rather than just above the loop so that it
+ ; is defined on EVERY path that reaches (ret) — including the empty-pool
+ ; early return two lines down. The SBC-DID-WALK log at (ret) reads it
+ ; unconditionally, and an unset variable there would log an empty field.
+ same => n,Set(SBC_P_I=0)
  ; An NPA with no pool yields an empty count. Treat it as zero rather than
  ; letting an empty string reach $[] and throw an expression error.
- same => n,Set(SBC_P_CNT=${IF($["${ARG3}" != ""]?${ARG3}:0)})
+ same => n,Set(SBC_P_CNT=${IF($["${ARG2}" != ""]?${ARG2}:0)})
  same => n,GotoIf($[${SBC_P_CNT} < 1]?ret)
 
  ; One step per call, per pool. Not persisted: rotation only has to spread
@@ -761,10 +826,14 @@ exten => pick,1,Set(SBC_DID=)
 
  ; Walk the whole ring from the rotor position, taking the first DID under
  ; its cap. SBC_P_I is the number of candidates tried, so the loop visits
- ; every number exactly once before giving up.
- same => n,Set(SBC_P_I=0)
+ ; every number exactly once before giving up. SBC_P_I is initialised at the
+ ; top of the subroutine, not here, so it survives the empty-pool early return.
  same => n(loop),Set(SBC_P_IDX=$[( ( ${SBC_P_ROT} + ${SBC_P_I} ) % ${SBC_P_CNT} ) + 1])
- same => n,Set(SBC_P_CAND=${CUT(SBC_P_LIST,|,${SBC_P_IDX})})
+ ; One global per member. SBC_DID_P_<key>_<idx> holds an 11-character value,
+ ; so nothing here materialises the pool as a string. SBC_DID_POOL_<key> is
+ ; still rendered and still loaded, deliberately: it makes reverting this one
+ ; line a dialplan reload rather than a restart.
+ same => n,Set(SBC_P_CAND=${GLOBAL(SBC_DID_P_${SBC_P_KEY}_${SBC_P_IDX})})
 
  ; --- critical section, scoped to this one DID ---------------------------
  same => n,Set(SBC_P_TRIES=0)
@@ -796,7 +865,18 @@ exten => pick,1,Set(SBC_DID=)
 
  ; Fell off the end: every DID in this pool is at its cap. Returning with
  ; SBC_DID empty is what sends the caller to overflow, or to a 503.
- same => n(ret),Return()
+ ; SBC_P_I is the number of capped DIDs stepped over before this pick settled.
+ ; It is a Gosub local: it dies with the frame and never reaches CDR, so if it
+ ; is not logged here it is not measurable at all. Reconstructing it by
+ ; replaying selections against CDR was tried and reached only 49.6% agreement
+ ; with the DIDs actually chosen — not good enough to report from.
+ ;
+ ; Read it as: walk<cnt and did non-empty  -> found a DID after skipping walk
+ ;             walk==cnt and did empty     -> pool exhausted, caller falls
+ ;                                            through to overflow or 503
+ ;             cnt==0                      -> no pool for this key at all
+ same => n(ret),Log(NOTICE,SBC-DID-WALK pool=${SBC_P_KEY} walk=${SBC_P_I} cnt=${SBC_P_CNT} did=${SBC_DID})
+ same => n,Return()
 
 
 ; ===========================================================================
