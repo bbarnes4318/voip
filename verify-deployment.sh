@@ -128,6 +128,7 @@ TRACKED=(
   phraseguard/sbc-phraseguard.service
   tools/phraseguard-spike.sh
   tools/phraseguard-lint.py
+  tools/deploy-phraseguard.sh
 )
 
 # The files Asterisk actually reads. TRACKED covers the INPUTS to render.sh --

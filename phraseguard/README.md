@@ -375,18 +375,39 @@ annotated list. The ones that matter most:
 
 ## Install
 
-Nothing here restarts Asterisk, and nothing here belongs in `install.sh` —
-`install.sh` ends with `systemctl restart asterisk`, which would make installing
-a detector a voice event.
+One command, from a checkout on the box:
 
 ```bash
-# 1. copy phraseguard/ and tools/phraseguard-*.{sh,py} into /opt/sbc
-# 2. a speech model (only the small models carry the grammar FST)
+sudo ./tools/deploy-phraseguard.sh --dry-run    # see every action first
+sudo ./tools/deploy-phraseguard.sh --install
+sudo ./tools/deploy-phraseguard.sh --check      # is it working?
+sudo ./tools/deploy-phraseguard.sh --uninstall  # take it back off
+```
+
+It runs the preflight, fetches the speech model and the `vosk` module, copies
+the files, appends a settings block to `config.env` (backing it up first, and
+never editing a line that is already there), runs the daemon's own self-test,
+and only then installs and starts the unit. It is idempotent — re-running it is
+safe.
+
+**It never restarts or reloads Asterisk, and never touches anything under
+`/etc/asterisk`.** That is why it is a separate script and not part of
+`install.sh`, which ends in `systemctl restart asterisk`.
+
+If the preflight refuses, nothing has been installed and nothing has changed.
+A missing speech model is a warning, not a failure: PhraseGuard still runs, still
+correlates calls and still keeps the per-customer counters — it just matches
+nothing until a model is present.
+
+Doing it by hand instead:
+
+```bash
+# a speech model — only the SMALL models carry the grammar FST (Gr.fst)
 mkdir -p /opt/vosk && cd /opt/vosk
-# vosk-model-small-en-us-0.15  — has Gr.fst, ~40 MB
+curl -LO https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+unzip vosk-model-small-en-us-0.15.zip
 python3 -m pip install vosk
 
-# 3. the unit
 install -m 0644 /opt/sbc/phraseguard/sbc-phraseguard.service \
         /etc/systemd/system/sbc-phraseguard.service
 systemctl daemon-reload

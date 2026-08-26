@@ -357,6 +357,44 @@ run "spike syntax" 0 bash -n "$TOOLS/phraseguard-spike.sh"
 expect "the spike refuses its preflight without Asterisk" "Preflight refused" \
     env CONF=/dev/null PK_CLIENT_IPS="$CUST" "$TOOLS/phraseguard-spike.sh" --self-test
 
+head_ "8b. the deploy script"
+run "deploy syntax" 0 bash -n "$TOOLS/deploy-phraseguard.sh"
+# It must refuse rather than half-install when the box is not ready. A deploy
+# script that presses on through a failed preflight on a border element is the
+# thing that takes the trunk down.
+mkdir -p "$WORK/fakesbc"
+printf 'PK_CLIENT_IPS=%s\nRTP_START=10000\nRTP_END=20000\n' "$CUST" > "$WORK/fakesbc/config.env"
+expect "deploy refuses a preflight it cannot pass" "NOTHING was installed" \
+    "$TOOLS/deploy-phraseguard.sh" --install --sbc-dir "$WORK/fakesbc"
+if [[ -d "$WORK/fakesbc/phraseguard" ]]; then
+  bad "a refused deploy left files behind"
+else
+  ok "a refused deploy left nothing behind"
+fi
+# Comments are stripped first: the script TALKS about not restarting Asterisk,
+# and grepping the raw file for "render.sh" matches the comment that promises
+# it never runs one. What matters is whether any executable line does it.
+CODE="$WORK/deploy-code.sh"
+sed 's/[[:space:]]*#.*$//' "$TOOLS/deploy-phraseguard.sh" > "$CODE"
+for forbidden in "systemctl restart asterisk" "systemctl reload asterisk" \
+                 "pjsip reload" "module reload" "render.sh" "install.sh" \
+                 "nft " "killswitch"; do
+  if grep -qF -- "$forbidden" "$CODE"; then
+    bad "deploy must never invoke: $forbidden" "$(grep -nF -- "$forbidden" "$CODE" | head -2)"
+  else
+    ok "deploy never invokes: $forbidden"
+  fi
+done
+
+# /etc/asterisk may be READ -- the preflight checks the live dialplan for
+# __SBC_CALLID, which is the whole point of reading it. It must never be
+# WRITTEN: no redirect into it, no cp/mv/install/sed -i/tee targeting it.
+if grep -nE '(>>?[[:space:]]*/etc/asterisk|(cp|mv|install|tee|touch|rm|chmod|chown)[^|]*[[:space:]]/etc/asterisk|sed[^|]*-i[^|]*/etc/asterisk)' "$CODE"; then
+  bad "deploy must never WRITE to /etc/asterisk"
+else
+  ok "deploy reads /etc/asterisk but never writes to it"
+fi
+
 # ---------------------------------------------------------------------------
 head_ "9. shell and python syntax"
 for f in "$TOOLS/phraseguard-spike.sh"; do
