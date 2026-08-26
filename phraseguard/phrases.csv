@@ -71,14 +71,21 @@ A,A1,en,brand,team viewer,
 A,A1,en,brand,logmein,
 A,A1,en,seq,log me in,DEMOTE-CANDIDATE — three common tokens; watch this one in shadow
 A,A1,en,brand,gotoassist,
+A,A1,en,seq,go to assist,spelled-apart twin: 'gotoassist' is not in the Vosk lexicon
 A,A1,en,brand,screenconnect,
+A,A1,en,pair,screen connect,spelled-apart twin: 'screenconnect' is not in the Vosk lexicon
 A,A1,en,pair,connectwise control,
 A,A1,en,brand,splashtop,
+A,A1,en,pair,splash top,spelled-apart twin: 'splashtop' is not in the Vosk lexicon
 A,A1,en,pair,zoho assist,
 A,A1,en,pair,ammyy admin,
+A,A1,en,pair,ami admin,'ammyy' is not in the Vosk lexicon; 'ami' is what it will emit
 A,A1,en,brand,aeroadmin,
+A,A1,en,pair,aero admin,spelled-apart twin: 'aeroadmin' is not in the Vosk lexicon
 A,A1,en,brand,rustdesk,
+A,A1,en,pair,rust desk,spelled-apart twin: 'rustdesk' is not in the Vosk lexicon
 A,A1,en,brand,dwservice,
+A,A1,en,seq,d w service,spelled-apart twin: 'dwservice' is not in the Vosk lexicon
 A,A1,en,pair,supremo remote,
 A,A1,en,pair,quick assist,DEMOTE-CANDIDATE — "quick assist" occurs as ordinary English
 A,A1,en,seq,chrome remote desktop,
@@ -102,6 +109,7 @@ A,A2,en,pair,steam card,
 A,A2,en,pair,vanilla card,
 A,A2,en,pair,vanilla reload,
 A,A2,en,brand,moneypak,
+A,A2,en,pair,money pak,spelled-apart twin: 'moneypak' is not in the Vosk lexicon
 A,A2,en,seq,green dot card,
 A,A2,en,seq,target gift card,
 A,A2,en,seq,walmart gift card,
@@ -109,6 +117,7 @@ A,A2,en,seq,best buy gift card,
 A,A2,en,seq,ebay gift card,
 A,A2,en,seq,sephora gift card,
 A,A2,en,pair,razer gold,
+A,A2,en,pair,razor gold,'razer' is not in the Vosk lexicon; 'razor' is the homophone it will emit
 A,A2,en,seq,scratch off the back,
 A,A2,en,seq,read me the numbers on the back,
 A,A2,en,seq,the code on the back of the card,
@@ -124,7 +133,9 @@ A,A3,en,pair,bitcoin atm,
 A,A3,en,pair,crypto atm,
 A,A3,en,pair,bitcoin depot,
 A,A3,en,brand,coinme,
+A,A3,en,pair,coin me,spelled-apart twin: 'coinme' is not in the Vosk lexicon
 A,A3,en,brand,rockitcoin,
+A,A3,en,seq,rock it coin,spelled-apart twin: 'rockitcoin' is not in the Vosk lexicon
 A,A3,en,pair,athena bitcoin,
 A,A3,en,brand,coinstar,
 A,A3,en,pair,wallet address,
@@ -209,9 +220,11 @@ A,A7,en,seq,read me the code from your phone,
 A,A7,en,seq,read back the verification code,
 A,A7,en,seq,your online banking password,
 A,A7,en,seq,your netbanking password,
+A,A7,en,seq,your net banking password,spelled-apart twin: 'netbanking' is not in the Vosk lexicon
 A,A7,en,seq,the three digits on the back of your card,
 A,A7,en,seq,the security code on the back,
 A,A7,en,pair,cvv number,
+A,A7,en,seq,c v v number,spelled-out twin: 'cvv' is not in the Vosk lexicon
 A,A7,en,seq,your full social security number,
 A,A7,en,seq,your complete social,
 

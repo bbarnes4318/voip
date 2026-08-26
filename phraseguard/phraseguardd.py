@@ -339,6 +339,17 @@ class PhraseGuard(object):
                       % (self.scorer.threshold, cfg.window_s,
                          self.scorer.c1_weight, self.scorer.c2_weight)))
         lines.append(("ASR", self.asr.status))
+        if self.asr.oov:
+            # Not a footnote. Every one of these is a corpus word the decoder
+            # can never emit, so the phrases built from it cannot fire.
+            lines.append(("ASR VOCABULARY",
+                          "%d corpus word(s) are NOT in the model's lexicon and "
+                          "can never be recognised: %s"
+                          % (len(self.asr.oov), ", ".join(self.asr.oov[:12])
+                             + (" ..." if len(self.asr.oov) > 12 else ""))))
+            lines.append(("", "Phrases relying only on those words are DEAD. "
+                              "Spelled-apart forms (\"any desk\") still work "
+                              "and the phonetic matcher folds them together."))
 
         ami = probe_ami(cfg.manager_conf)
         lines.append(("AMI", ("ENABLED" if ami["enabled"] else

@@ -46,6 +46,7 @@ never be the reason a call fails to connect.
   ./asr.py --bench          measure realtime factor and cores per stream
   ./asr.py --grammar        print the grammar this corpus produces
 """
+import array
 import json
 import os
 import sys
@@ -56,7 +57,78 @@ try:
 except ImportError:                                    # run as a script
     from matcher import Corpus, _NUMBER_WORDS
 
+# The trunk's rate. G.711 is 8 kHz and that is not negotiable.
 SAMPLE_RATE = 8000
+
+# ---------------------------------------------------------------------------
+# THE RATE MISMATCH, and why there is a resampler in here
+# ---------------------------------------------------------------------------
+# Every general-purpose Vosk English model is trained at 16 kHz. Telephony is
+# 8 kHz. Feeding 8 kHz PCM to a 16 kHz recogniser does not degrade gracefully,
+# it throws:
+#
+#   ERROR (VoskAPI:MaybeCreateResampler()): Sampling frequency mismatch,
+#   expected 16000, got 8000
+#   Exception: Failed to process waveform
+#
+# So the audio is upsampled to the model's native rate before it is handed
+# over. That is the standard approach for telephony with Vosk, and it is worth
+# being honest about the cost: upsampling invents no information. The band
+# above 4 kHz stays empty, and a model trained on wideband speech is being
+# asked to work without it, so word error rate is worse than a purpose-built
+# 8 kHz telephony model would give. There is no official 8 kHz English Vosk
+# model to use instead; if one is ever built for this, point
+# PHRASEGUARD_VOSK_MODEL at it and the resampler below no-ops automatically.
+#
+# The rate is READ FROM THE MODEL rather than assumed, so swapping models does
+# not silently reintroduce the mismatch.
+
+
+def model_sample_rate(model_path, default=16000):
+    """The model's native rate, from conf/mfcc.conf. Never raises."""
+    try:
+        conf = os.path.join(model_path, "conf", "mfcc.conf")
+        with open(conf, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "sample-frequency" in line:
+                    return int(float(line.split("=", 1)[1].strip()))
+    except Exception:                                  # noqa: BLE001
+        pass
+    return default
+
+
+def upsample_2x(pcm):
+    """8 kHz PCM16 -> 16 kHz PCM16, linear interpolation.
+
+    Native byte order matches the little-endian PCM16 tap.decode_g711 emits on
+    every architecture this runs on. One inserted sample per input sample,
+    averaged with its predecessor: cheap, and the decoder cares about the
+    spectral envelope rather than the interpolation being ideal.
+    """
+    src = array.array("h")
+    src.frombytes(pcm)
+    if not src:
+        return pcm
+    dst = array.array("h", bytes(len(pcm) * 2))
+    prev = src[0]
+    for i, s in enumerate(src):
+        dst[2 * i] = (prev + s) // 2
+        dst[2 * i + 1] = s
+        prev = s
+    return dst.tobytes()
+
+
+def resample_to(pcm, src_rate, dst_rate):
+    """Only the 8k -> 16k case the trunk actually produces. Otherwise passthrough."""
+    if src_rate == dst_rate:
+        return pcm
+    if dst_rate == src_rate * 2:
+        return upsample_2x(pcm)
+    # Anything else is a model this component has not been sized for. Passing
+    # the audio through unchanged would throw inside Vosk; saying so is better.
+    raise ValueError(
+        "cannot resample %d Hz to %d Hz: PhraseGuard handles 8 kHz telephony "
+        "audio into an 8 kHz or 16 kHz model only" % (src_rate, dst_rate))
 
 # Vosk's out-of-grammar token. normalize() in matcher.py strips it, but it is
 # named here too so the daemon can count how much of what it hears is outside
@@ -136,12 +208,14 @@ class VoskRecognizer(object):
     """
     available = True
 
-    def __init__(self, model, grammar_json, sample_rate=SAMPLE_RATE):
+    def __init__(self, model, grammar_json, model_rate=16000):
         vosk = _import_vosk()
+        # Built at the MODEL's rate, not the trunk's. accept() resamples.
+        self.model_rate = model_rate
         if grammar_json:
-            self.rec = vosk.KaldiRecognizer(model, sample_rate, grammar_json)
+            self.rec = vosk.KaldiRecognizer(model, model_rate, grammar_json)
         else:
-            self.rec = vosk.KaldiRecognizer(model, sample_rate)
+            self.rec = vosk.KaldiRecognizer(model, model_rate)
         self.rec.SetWords(True)
         self.audio_seconds = 0.0
         self.decode_seconds = 0.0
@@ -153,7 +227,11 @@ class VoskRecognizer(object):
         next frame, and acting on retractable text is how a detector
         disconnects a call over a word that was never said.
         """
+        # audio_seconds counts REAL time on the trunk, so it stays in 8 kHz
+        # terms whatever the model wants. Counting resampled bytes would halve
+        # the realtime factor and make the CPU budget look twice as good as it is.
         self.audio_seconds += len(pcm) / float(SAMPLE_RATE * 2)
+        pcm = resample_to(pcm, SAMPLE_RATE, self.model_rate)
         t0 = time.time()
         try:
             done = self.rec.AcceptWaveform(pcm)
@@ -270,6 +348,43 @@ def load_script(path):
         return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
 
 
+def out_of_vocabulary(model_path, grammar_json):
+    """Grammar words the model's lexicon does not contain.
+
+    Vosk logs "Ignoring word missing in vocabulary" for each of these and then
+    carries on, so the grammar silently loses entries. On the first real run
+    that was SIXTEEN corpus words, all of them Tier A brand nouns -- anydesk,
+    teamviewer, screenconnect, splashtop, moneypak, cvv and the rest. A1 is
+    described in the brief as one of the strongest scam signals, and it was
+    effectively blind with nothing in PhraseGuard's own output saying so.
+
+    Vosk's warnings go to its C++ logger, not to Python, so they cannot be
+    captured. Reading the lexicon directly is how this becomes visible in the
+    daemon's own preflight. Returns [] if the word list cannot be read -- a
+    missing file is not evidence of a missing word.
+    """
+    words = set()
+    for rel in (("graph", "words.txt"), ("graph", "phones", "word_boundary.int")):
+        p = os.path.join(model_path, *rel)
+        if not os.path.exists(p) or not rel[-1].endswith("words.txt"):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    w = line.split(" ", 1)[0].strip().lower()
+                    if w:
+                        words.add(w)
+        except OSError:
+            return []
+    if not words:
+        return []
+    try:
+        grammar = [w for w in json.loads(grammar_json) if w != UNK]
+    except Exception:                                  # noqa: BLE001
+        return []
+    return sorted(w for w in grammar if w not in words)
+
+
 class RecognizerFactory(object):
     """Loads the model once, hands out per-stream recognisers.
 
@@ -287,6 +402,8 @@ class RecognizerFactory(object):
         self.grammar = None
         self.status = "not loaded"
         self.grammar_supported = None
+        self.model_rate = 16000
+        self.oov = []
 
     def load(self):
         if self.script:
@@ -316,14 +433,21 @@ class RecognizerFactory(object):
         except Exception as e:                         # noqa: BLE001
             self.status = "model load failed: %s -- detection DISABLED" % e
             return False
+        self.model_rate = model_sample_rate(self.model_path)
         if self.use_grammar:
             self.grammar = build_grammar(self.corpus)
+            self.oov = out_of_vocabulary(self.model_path, self.grammar)
         note = ""
         if self.use_grammar and not self.grammar_supported:
             note = ("  WARNING: this model has no Gr.fst; the grammar will be "
                     "IGNORED and CPU will be ~10x. Use a model built with a "
                     "grammar, e.g. vosk-model-small-en-us-0.15.")
-        self.status = "vosk model loaded from %s%s" % (self.model_path, note)
+        rate_note = ""
+        if self.model_rate != SAMPLE_RATE:
+            rate_note = ("  [%d Hz model; 8 kHz trunk audio is upsampled, which "
+                         "costs accuracy -- see the header]" % self.model_rate)
+        self.status = "vosk model loaded from %s%s%s" % (
+            self.model_path, rate_note, note)
         return True
 
     def new(self):
@@ -332,7 +456,7 @@ class RecognizerFactory(object):
         if self.model is None:
             return NullRecognizer(self.status)
         try:
-            return VoskRecognizer(self.model, self.grammar)
+            return VoskRecognizer(self.model, self.grammar, self.model_rate)
         except Exception as e:                         # noqa: BLE001
             return NullRecognizer("recogniser construction failed: %s" % e)
 

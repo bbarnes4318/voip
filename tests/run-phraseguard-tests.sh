@@ -203,6 +203,46 @@ sys.exit(0 if st.call_id == "abc@floor" else 1)
 PY
 
 # ---------------------------------------------------------------------------
+head_ "4b. the 8 kHz -> 16 kHz rate bridge"
+# REGRESSION: every general-purpose Vosk English model is 16 kHz and this trunk
+# is 8 kHz G.711. Feeding 8 kHz PCM to a 16 kHz recogniser does not degrade, it
+# throws "Sampling frequency mismatch, expected 16000, got 8000" on the FIRST
+# frame -- so with the shipped model PhraseGuard could not process one packet.
+python3 - "$PG" <<'PY' && ok "8 kHz audio is bridged to a 16 kHz model" \
+    || bad "8 kHz audio is bridged to a 16 kHz model"
+import array, sys
+sys.path.insert(0, sys.argv[1])
+from asr import upsample_2x, resample_to
+src = array.array("h", [0, 1000, 2000, 1000, 0, -1000, -2000, -1000] * 20)
+pcm = src.tobytes()
+up = upsample_2x(pcm)
+out = array.array("h"); out.frombytes(up)
+# Twice the samples for the same wall-clock duration, originals preserved.
+assert len(up) == len(pcm) * 2, "not 2x"
+assert list(out[1::2]) == list(src), "original samples not preserved"
+assert resample_to(pcm, 8000, 8000) == pcm, "8k->8k should pass through"
+try:
+    resample_to(pcm, 8000, 44100)
+except ValueError:
+    pass
+else:
+    raise AssertionError("an unsupported rate must be refused, not mangled")
+sys.exit(0)
+PY
+
+python3 - "$PG" <<'PY' && ok "the model's native rate is read, not assumed" \
+    || bad "the model's native rate is read, not assumed"
+import os, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+from asr import model_sample_rate
+d = tempfile.mkdtemp(); os.makedirs(os.path.join(d, "conf"))
+with open(os.path.join(d, "conf", "mfcc.conf"), "w") as fh:
+    fh.write("--use-energy=false\n--sample-frequency=8000\n")
+assert model_sample_rate(d) == 8000, "did not read the model rate"
+assert model_sample_rate("/no/such/model") == 16000, "wrong default"
+sys.exit(0)
+PY
+
 head_ "5. the daemon, end to end, with a scripted recogniser"
 cat > "$WORK/script.txt" <<'EOF'
 hello sir am i speaking with the homeowner today
