@@ -164,11 +164,26 @@ cd '$RemoteStage'
 # this box, and a minimal Hetzner image often has no sudo at all -- hardcoding
 # it turns a working login into "sudo: command not found".
 if [ "`$(id -u)" = 0 ]; then SUDO=; elif command -v sudo >/dev/null; then SUDO=sudo; else echo 'not root and no sudo on this box' >&2; exit 2; fi
+# set -e off from here: the deploy script reports its own failures with exit
+# codes we want to pass through, and under set -e a non-zero exit would abort
+# before the cleanup below and leave the staging directory on the box.
+set +e
 `$SUDO bash ./tools/deploy-phraseguard.sh $ActionFlag $Extra
 rc=`$?
 rm -rf '$RemoteStage'
 exit `$rc
 "@
+
+# STRIP CARRIAGE RETURNS. This file is stored CRLF (see .gitattributes -- it is
+# a Windows file and Notepad has to be able to read it), so a PowerShell
+# here-string built from it carries \r\n on every line. ssh hands that to bash
+# verbatim, and bash treats the \r as part of the token: "set -e\r" becomes an
+# invalid option, and the terminal prints the mangled ": invalid optiont: -"
+# because the CR rewinds the line mid-write.
+#
+# The .sh --remote path never hit this because it builds a single-line command.
+$RemoteCmd = $RemoteCmd -replace "`r", ""
+if ($RemoteCmd -match "`r") { Bad "internal: CR survived in the remote command"; exit 2 }
 
 & ssh -t -o ConnectTimeout=15 $Remote $RemoteCmd
 $rc = $LASTEXITCODE
