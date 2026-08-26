@@ -46,6 +46,7 @@ as it is consumed. --pcap exists to replay a capture somebody else made
 """
 import collections
 import math
+import select
 import os
 import struct
 import subprocess
@@ -122,10 +123,27 @@ class PcapError(Exception):
     pass
 
 
-def _read_exact(fh, n):
-    """Read exactly n bytes or return None at clean EOF."""
+def _read_exact(fh, n, stop=None):
+    """Read exactly n bytes. None at clean EOF, or when stop() goes True.
+
+    select() with a short timeout rather than a bare blocking read, so a caller
+    with a deadline is not held hostage by a quiet wire. Without this,
+    `tap.py --report --seconds 60` on a trunk with no customer-leg RTP blocked
+    forever on the very first read and printed nothing at all -- the deadline
+    was only ever checked between packets that never came.
+    """
     buf = b""
+    try:
+        fd = fh.fileno()
+    except Exception:                                  # noqa: BLE001
+        fd = None
     while len(buf) < n:
+        if stop is not None and stop():
+            return None
+        if fd is not None:
+            r, _w, _x = select.select([fd], [], [], 0.5)
+            if not r:
+                continue
         chunk = fh.read(n - len(buf))
         if not chunk:
             return None
@@ -150,9 +168,9 @@ def _chain_first(first, rest):
         yield pkt
 
 
-def read_pcap_stream(fh):
+def read_pcap_stream(fh, stop=None):
     """Yield (ts, src, sport, dst, dport, payload) for every UDP packet."""
-    gh = _read_exact(fh, 24)
+    gh = _read_exact(fh, 24, stop)
     if gh is None:
         # EOF before even the 24-byte global header. tcpdump exited instead of
         # capturing. Returning quietly here made the daemon look like a clean
@@ -173,11 +191,11 @@ def read_pcap_stream(fh):
     off0 = LINKTYPES[link]
 
     while True:
-        ph = _read_exact(fh, 16)
+        ph = _read_exact(fh, 16, stop)
         if ph is None:
             return
         _ts, tus, incl, _orig = struct.unpack(e + "IIII", ph)
-        data = _read_exact(fh, incl)
+        data = _read_exact(fh, incl, stop)
         if data is None:
             return
         if len(data) < off0 + 20:
@@ -657,6 +675,16 @@ class Tap(object):
         lines = [l.strip() for l in err.split("\n") if l.strip()]
         return "; ".join(lines[:3])
 
+    def _iter(self, fh, stop):
+        """read_pcap_stream, with tcpdump's own stderr attached to a failure."""
+        try:
+            for pkt in read_pcap_stream(fh, stop):
+                yield pkt
+        except CaptureFailed as e:
+            detail = self.capture_error()
+            raise CaptureFailed(
+                "%s. tcpdump: %s" % (e, detail or "(no output on stderr)"))
+
     def run(self, on_audio=None, on_packet=None, stop=None):
         """Read until EOF or `stop()` returns True.
 
@@ -667,21 +695,12 @@ class Tap(object):
         fh, proc = self._open()
         self.proc = proc
         try:
-            try:
-                stream = read_pcap_stream(fh)
-                first = next(stream, None)
-            except CaptureFailed as e:
-                # Re-raise naming what tcpdump actually said. This is the
-                # difference between "the detector is not running and here is
-                # the one line explaining why" and a unit that exits 0.
-                detail = self.capture_error()
-                raise CaptureFailed(
-                    "%s. tcpdump: %s" % (e, detail or "(no output on stderr)"))
-            if first is None:
-                raise CaptureFailed(
-                    "capture ended immediately. tcpdump: %s"
-                    % (self.capture_error() or "(no output on stderr)"))
-            for pkt in _chain_first(first, stream):
+            # The try must wrap the ITERATION, not the call. read_pcap_stream
+            # is a generator: calling it only builds the object, and the
+            # CaptureFailed fires on the first next(). Wrapping the call alone
+            # produced the right exit code with tcpdump's own message missing,
+            # which is most of what makes the error worth having.
+            for pkt in self._iter(fh, stop):
                 if stop is not None and stop():
                     break
                 ts, src, sport, dst, dport, payload = pkt
@@ -716,6 +735,15 @@ class Tap(object):
                     self.stats["asr_errors"] += 1
                 if stop is not None and stop():
                     break
+            # Ran out of packets. Distinguish a quiet wire from a dead capture:
+            # a tcpdump still running has simply seen nothing, which on a trunk
+            # whose calls mostly never carry audio is the expected answer, not
+            # an error. A tcpdump that has EXITED is a failure and says why.
+            if self.stats["packets"] == 0 and self.proc is not None:
+                if self.proc.poll() is not None:
+                    raise CaptureFailed(
+                        "tcpdump exited without capturing anything. tcpdump: %s"
+                        % (self.capture_error() or "(no output on stderr)"))
         finally:
             self.close()
 
@@ -888,11 +916,32 @@ def main(argv=None):
     # A replayed pcap runs to EOF; a live tap runs for --seconds, or until
     # Ctrl-C when --seconds is 0.
     deadline = None if a.pcap or not a.seconds else t0 + a.seconds
+    if not a.pcap:
+        sys.stderr.write(
+            "capturing for %ss on %s ... (a quiet trunk prints nothing until "
+            "the end)\n" % (a.seconds or "unlimited", a.iface))
+        sys.stderr.flush()
+
+    # A heartbeat, so a run that finds nothing is visibly ALIVE rather than
+    # looking hung. The first live attempt at this printed absolutely nothing
+    # for 70 seconds and was reasonably assumed to be broken.
+    state = {"last": t0}
+
+    def _stop():
+        now = time.time()
+        if not a.pcap and now - state["last"] >= 10:
+            state["last"] = now
+            sys.stderr.write("  %3ds  packets=%d  sip=%d  rtp=%d  streams=%d\n"
+                             % (now - t0, tap.stats["packets"], tap.stats["sip"],
+                                tap.stats["rtp"], len(tap.demux.streams)))
+            sys.stderr.flush()
+        return deadline is not None and now > deadline
+
     try:
-        tap.run(on_audio=None,
-                stop=(lambda: deadline is not None and time.time() > deadline))
+        tap.run(on_audio=None, stop=_stop)
     except PcapError as e:
         sys.stderr.write("tap.py: %s\n" % e)
+        _report(tap, time.time() - t0)
         return 1
     except KeyboardInterrupt:
         pass
