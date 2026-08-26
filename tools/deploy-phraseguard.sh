@@ -8,6 +8,17 @@
 #   ./deploy-phraseguard.sh --install     do it
 #   ./deploy-phraseguard.sh --uninstall   stop it and remove it
 #
+# Add --remote root@HOST to any of those to run it ON the box from a machine
+# that has ssh to it:
+#
+#   ./deploy-phraseguard.sh --remote root@167.235.206.206 --dry-run
+#   ./deploy-phraseguard.sh --remote root@167.235.206.206 --install
+#   ./deploy-phraseguard.sh --remote root@167.235.206.206 --check
+#
+# It scp-equivalents the files over and re-invokes itself there, so there is
+# exactly one implementation of the install and it is the one that runs on the
+# box. Same idiom as verify-deployment.sh --remote.
+#
 # WHAT IT WILL NOT DO, EVER
 # -------------------------
 # It does not restart Asterisk. It does not reload Asterisk. It does not touch
@@ -56,6 +67,8 @@ MODEL_URL="https://alphacephei.com/vosk/models/${MODEL_NAME}.zip"
 MODEL_PATH=""
 MODE=""
 DRY=0
+REMOTE=""
+PASSTHRU=()
 
 B=$'\033[1m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
 [[ -t 1 ]] || { B=""; R=""; G=""; Y=""; D=""; N=""; }
@@ -79,18 +92,75 @@ run() { # run <description> <cmd...>
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --install)   MODE="install"; shift ;;
-    --check)     MODE="check"; shift ;;
-    --uninstall) MODE="uninstall"; shift ;;
-    --dry-run)   MODE="${MODE:-install}"; DRY=1; shift ;;
-    --model)     MODEL_PATH="$2"; shift 2 ;;
-    --sbc-dir)   SBC_DIR="$2"; DEST="$2/phraseguard"; CONF="$2/config.env"; shift 2 ;;
-    --conf)      CONF="$2"; shift 2 ;;
+    --install)   MODE="install"; PASSTHRU+=("$1"); shift ;;
+    --check)     MODE="check"; PASSTHRU+=("$1"); shift ;;
+    --uninstall) MODE="uninstall"; PASSTHRU+=("$1"); shift ;;
+    --dry-run)   MODE="${MODE:-install}"; DRY=1; PASSTHRU+=("$1"); shift ;;
+    --model)     MODEL_PATH="$2"; PASSTHRU+=("$1" "$2"); shift 2 ;;
+    --sbc-dir)   SBC_DIR="$2"; DEST="$2/phraseguard"; CONF="$2/config.env"
+                 PASSTHRU+=("$1" "$2"); shift 2 ;;
+    --conf)      CONF="$2"; PASSTHRU+=("$1" "$2"); shift 2 ;;
+    --remote)    REMOTE="$2"; shift 2 ;;
     -h|--help)   sed -n '2,44p' "$0"; exit 0 ;;
     *) die "unknown argument '$1'" ;;
   esac
 done
 [[ -n "$MODE" ]] || die "pick one of --check, --dry-run, --install, --uninstall (see --help)"
+
+# ===========================================================================
+# --remote : run this same script ON the box, over ssh
+# ===========================================================================
+# The SBC is deployed by scp, deliberately -- no .git and no credentials on the
+# one host that terminates customer traffic (see verify-deployment.sh). So this
+# ships the files and then re-invokes ITSELF there.
+#
+# One implementation, not two. Everything below this block runs on the box
+# either way; --remote only decides how it got there. A separate "remote
+# install" code path would be a second thing to keep correct, and the one that
+# never gets tested is always the one that runs on the night it matters.
+if [[ -n "$REMOTE" ]]; then
+  command -v ssh  >/dev/null || die "no ssh client on THIS machine. Run this from a machine that can reach the box."
+  command -v tar  >/dev/null || die "tar is required to stage the files"
+
+  echo
+  echo "  staging PhraseGuard onto ${B}$REMOTE${N} and running there"
+  echo "  ${D}Asterisk is never restarted, reloaded, or written to.${N}"
+  echo
+
+  STAGE="/tmp/phraseguard-deploy.$$"
+  # -o BatchMode=no on purpose: an interactive key passphrase or password
+  # prompt has to reach the operator, and refusing to prompt would turn a
+  # working credential into a mysterious failure.
+  if ! tar cz -C "$SRC" phraseguard tools/deploy-phraseguard.sh \
+          tools/phraseguard-spike.sh tools/phraseguard-lint.py 2>/dev/null \
+       | ssh -o ConnectTimeout=15 "$REMOTE" "mkdir -p '$STAGE' && tar xz -C '$STAGE'"; then
+    echo
+    bad "could not copy the files to $REMOTE"
+    say "${D}Check: ssh $REMOTE 'echo ok'${N}"
+    echo
+    exit 2
+  fi
+  ok "files staged at $STAGE on $REMOTE"
+
+  # printf %q so a path with a space cannot break out of the remote command.
+  REMOTE_ARGS=""
+  for a in "${PASSTHRU[@]}"; do REMOTE_ARGS+=" $(printf '%q' "$a")"; done
+
+  # -t for a tty: sudo may need to prompt, and the deploy prints progress the
+  # operator should watch. The staging directory is removed whether the deploy
+  # succeeded or not.
+  ssh -t -o ConnectTimeout=15 "$REMOTE" \
+      "cd '$STAGE' && sudo bash ./tools/deploy-phraseguard.sh$REMOTE_ARGS; rc=\$?; rm -rf '$STAGE'; exit \$rc"
+  rc=$?
+  echo
+  if (( rc == 0 )); then
+    ok "remote deploy finished on $REMOTE"
+  else
+    bad "remote deploy exited $rc on $REMOTE"
+  fi
+  echo
+  exit "$rc"
+fi
 
 echo
 # ${DRY:+...} would fire on the string "0", which is set and non-empty, so
