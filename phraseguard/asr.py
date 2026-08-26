@@ -47,9 +47,12 @@ never be the reason a call fails to connect.
   ./asr.py --grammar        print the grammar this corpus produces
 """
 import array
+import contextlib
 import json
 import os
+import re
 import sys
+import tempfile
 import time
 
 try:
@@ -212,10 +215,19 @@ class VoskRecognizer(object):
         vosk = _import_vosk()
         # Built at the MODEL's rate, not the trunk's. accept() resamples.
         self.model_rate = model_rate
-        if grammar_json:
-            self.rec = vosk.KaldiRecognizer(model, model_rate, grammar_json)
-        else:
-            self.rec = vosk.KaldiRecognizer(model, model_rate)
+        # Vosk re-emits the whole "Ignoring word missing in vocabulary" list on
+        # EVERY recogniser it builds -- 16 lines per stream, straight into the
+        # journal. The factory has already reported that list once, properly,
+        # in the preflight, so it is captured here and dropped. Anything Vosk
+        # says that is NOT one of those warnings is re-emitted untouched.
+        with capture_c_stderr() as cap:
+            try:
+                if grammar_json:
+                    self.rec = vosk.KaldiRecognizer(model, model_rate, grammar_json)
+                else:
+                    self.rec = vosk.KaldiRecognizer(model, model_rate)
+            finally:
+                passthrough_non_oov(_drain(cap))
         self.rec.SetWords(True)
         self.audio_seconds = 0.0
         self.decode_seconds = 0.0
@@ -348,41 +360,67 @@ def load_script(path):
         return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
 
 
-def out_of_vocabulary(model_path, grammar_json):
-    """Grammar words the model's lexicon does not contain.
+_OOV_RE = re.compile(r"Ignoring word missing in vocabulary:\s*'([^']+)'")
 
-    Vosk logs "Ignoring word missing in vocabulary" for each of these and then
-    carries on, so the grammar silently loses entries. On the first real run
-    that was SIXTEEN corpus words, all of them Tier A brand nouns -- anydesk,
-    teamviewer, screenconnect, splashtop, moneypak, cvv and the rest. A1 is
-    described in the brief as one of the strongest scam signals, and it was
-    effectively blind with nothing in PhraseGuard's own output saying so.
 
-    Vosk's warnings go to its C++ logger, not to Python, so they cannot be
-    captured. Reading the lexicon directly is how this becomes visible in the
-    daemon's own preflight. Returns [] if the word list cannot be read -- a
-    missing file is not evidence of a missing word.
+@contextlib.contextmanager
+def capture_c_stderr():
+    """Capture writes to file descriptor 2, including from C++ libraries.
+
+    Vosk logs through Kaldi's C++ logger straight to fd 2. contextlib's
+    redirect_stderr only rebinds sys.stderr, which that never touches, so the
+    only way to see those lines from Python is to redirect the descriptor
+    itself.
+
+    The first attempt at finding dropped vocabulary read the model's word list
+    off disk instead. It found nothing, because vosk-model-small-en-us-0.15 has
+    no graph/words.txt -- graph/ holds Gr.fst, HCLr.fst, disambig_tid.int and
+    phones/ and nothing else. Asking the library what it actually decided beats
+    guessing at a file layout that varies between models.
     """
-    words = set()
-    for rel in (("graph", "words.txt"), ("graph", "phones", "word_boundary.int")):
-        p = os.path.join(model_path, *rel)
-        if not os.path.exists(p) or not rel[-1].endswith("words.txt"):
-            continue
-        try:
-            with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    w = line.split(" ", 1)[0].strip().lower()
-                    if w:
-                        words.add(w)
-        except OSError:
-            return []
-    if not words:
-        return []
+    saved = os.dup(2)
+    tmp = tempfile.TemporaryFile(mode="w+b")
     try:
-        grammar = [w for w in json.loads(grammar_json) if w != UNK]
+        sys.stderr.flush()
+        os.dup2(tmp.fileno(), 2)
+        yield tmp
+    finally:
+        try:
+            os.dup2(saved, 2)
+        finally:
+            os.close(saved)
+
+
+def _drain(tmp):
+    """Read a captured-stderr temp file back as text. Never raises."""
+    try:
+        tmp.flush()
+        tmp.seek(0)
+        return tmp.read().decode("utf-8", "replace")
     except Exception:                                  # noqa: BLE001
-        return []
-    return sorted(w for w in grammar if w not in words)
+        return ""
+    finally:
+        try:
+            tmp.close()
+        except Exception:                              # noqa: BLE001
+            pass
+
+
+def parse_oov(text):
+    """Words Vosk said it was dropping from the grammar, deduplicated."""
+    return sorted(set(_OOV_RE.findall(text or "")))
+
+
+def passthrough_non_oov(text):
+    """Re-emit captured stderr EXCEPT the benign vocabulary warnings.
+
+    Swallowing fd 2 wholesale would hide a real error. Only the lines already
+    accounted for in the preflight are dropped; anything else Vosk has to say
+    still reaches the journal.
+    """
+    for line in (text or "").split("\n"):
+        if line.strip() and not _OOV_RE.search(line):
+            sys.stderr.write(line + "\n")
 
 
 class RecognizerFactory(object):
@@ -436,7 +474,16 @@ class RecognizerFactory(object):
         self.model_rate = model_sample_rate(self.model_path)
         if self.use_grammar:
             self.grammar = build_grammar(self.corpus)
-            self.oov = out_of_vocabulary(self.model_path, self.grammar)
+            # Build one throwaway recogniser with fd 2 captured, purely to find
+            # out which grammar words the model will silently drop.
+            try:
+                with capture_c_stderr() as cap:
+                    vosk.KaldiRecognizer(self.model, self.model_rate, self.grammar)
+                text = _drain(cap)
+                self.oov = parse_oov(text)
+                passthrough_non_oov(text)
+            except Exception:                          # noqa: BLE001
+                self.oov = []
         note = ""
         if self.use_grammar and not self.grammar_supported:
             note = ("  WARNING: this model has no Gr.fst; the grammar will be "

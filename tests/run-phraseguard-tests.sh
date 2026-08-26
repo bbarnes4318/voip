@@ -243,6 +243,44 @@ assert model_sample_rate("/no/such/model") == 16000, "wrong default"
 sys.exit(0)
 PY
 
+# REGRESSION: Vosk drops grammar words the model's lexicon lacks and reports it
+# through Kaldi's C++ logger straight to fd 2, where sys.stderr and
+# redirect_stderr never see it. On the first real run that was 16 Tier A brand
+# nouns silently removed from the grammar. The first fix read the model's word
+# list off disk and found nothing, because vosk-model-small-en-us-0.15 has no
+# graph/words.txt. Asking the library what it decided is the robust route.
+python3 - "$PG" <<'PY' && ok "Vosk's dropped-vocabulary warnings are captured from fd 2" \
+    || bad "Vosk's dropped-vocabulary warnings are captured from fd 2"
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from asr import capture_c_stderr, _drain, parse_oov
+sample = (b"WARNING (VoskAPI:UpdateGrammarFst()) Ignoring word missing in vocabulary: 'anydesk'\n"
+          b"WARNING (VoskAPI:UpdateGrammarFst()) Ignoring word missing in vocabulary: 'teamviewer'\n"
+          b"WARNING (VoskAPI:UpdateGrammarFst()) Ignoring word missing in vocabulary: 'anydesk'\n")
+with capture_c_stderr() as cap:
+    os.write(2, sample)          # the DESCRIPTOR, as a C++ library writes it
+assert parse_oov(_drain(cap)) == ["anydesk", "teamviewer"], "OOV not parsed/deduped"
+sys.exit(0)
+PY
+
+python3 - "$PG" <<'PY' && ok "a real Vosk error is NOT swallowed with the noise" \
+    || bad "a real Vosk error is NOT swallowed with the noise"
+import io, sys
+sys.path.insert(0, sys.argv[1])
+from asr import passthrough_non_oov
+buf = io.StringIO(); real = sys.stderr; sys.stderr = buf
+try:
+    passthrough_non_oov(
+        "WARNING (VoskAPI) Ignoring word missing in vocabulary: 'anydesk'\n"
+        "ERROR (VoskAPI) a real problem\n")
+finally:
+    sys.stderr = real
+out = buf.getvalue()
+assert "a real problem" in out, "the real error was swallowed"
+assert "anydesk" not in out, "the benign warning was not suppressed"
+sys.exit(0)
+PY
+
 head_ "5. the daemon, end to end, with a scripted recogniser"
 cat > "$WORK/script.txt" <<'EOF'
 hello sir am i speaking with the homeowner today
