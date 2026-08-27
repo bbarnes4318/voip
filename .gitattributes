@@ -18,3 +18,8 @@
 *.md    text eol=lf
 *.service text eol=lf
 *.timer text eol=lf
+# The opposite rule, and for the same reason. tools/deploy-phraseguard.ps1 runs
+# on the operator's Windows machine, never on the SBC. LF endings there render
+# the whole file as one line in Notepad, which is what somebody will open it
+# with when they want to check what it does before running it as root.
+*.ps1   text eol=crlf
