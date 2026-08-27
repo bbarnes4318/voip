@@ -124,6 +124,9 @@ RTP_START="${RTP_START:-10000}"
 RTP_END="${RTP_END:-20000}"
 MAX_CONCURRENT_PER_IP="${MAX_CONCURRENT_PER_IP:-50}"
 MAX_CPS="${MAX_CPS:-10}"
+# Per-gateway CPS ceiling. FracTEL grants CPS per proxy IP, so this is a
+# separate limit from MAX_CPS rather than MAX_CPS divided by the gateway count.
+MAX_CPS_PER_GW="${MAX_CPS_PER_GW:-50}"
 NANP_ONLY="${NANP_ONLY:-true}"
 BLOCK_HIGH_RISK_NPA="${BLOCK_HIGH_RISK_NPA:-true}"
 BLOCK_976="${BLOCK_976:-true}"
@@ -179,6 +182,16 @@ SBC_NAT_LOCAL_NET="${SBC_NAT_LOCAL_NET:-}"
 
 [[ "$DID_DAILY_CAP" =~ ^[0-9]+$ ]] && (( DID_DAILY_CAP > 0 )) || \
   die "DID_DAILY_CAP must be a positive integer, got '$DID_DAILY_CAP'"
+
+[[ "$MAX_CPS_PER_GW" =~ ^[0-9]+$ ]] && (( MAX_CPS_PER_GW > 0 )) || \
+  die "MAX_CPS_PER_GW must be a positive integer, got '$MAX_CPS_PER_GW'"
+# A per-gateway ceiling above the global one is unreachable: the global CPS
+# check runs first and refuses the call before the gateway is even chosen.
+(( MAX_CPS_PER_GW <= MAX_CPS )) || \
+  die "MAX_CPS_PER_GW ($MAX_CPS_PER_GW) is above MAX_CPS ($MAX_CPS).
+
+       The global ceiling is checked first, so the per-gateway grant could
+       never be reached. Raise MAX_CPS or lower MAX_CPS_PER_GW."
 [[ "$OVERFLOW_MIN" =~ ^[0-9]+$ ]] || \
   die "OVERFLOW_MIN must be an integer, got '$OVERFLOW_MIN'"
 
@@ -560,8 +573,58 @@ fi
        The SBC assigns caller ID from this file. It cannot place a call
        without it."
 
-declare -A DID_POOL=() DID_MEMBER=() DID_HOME=()
+# --- NPA groups -------------------------------------------------------------
+# NPAs that serve the same geography. An overlay is mutual: 803 and 839 cover
+# identical territory, so an 839 number is valid local presence for an 803
+# destination and vice versa. A DID keyed to any NPA in a group is emitted into
+# the pool of every NPA in that group.
+#
+# This is why overlay stock is worth buying at all. Pools key on the literal
+# NPA string, so without this an 839 number sits in an 839 pool and never
+# serves an 803 destination -- 73% of an overlay-heavy order would be idle.
+#
+# The daily cap is keyed on the NUMBER, so a grouped DID shares one 200/day
+# budget across every pool it lands in. That is reported by the existing
+# "sharing one daily cap" note.
+declare -A NPA_GROUP=()
+NPA_GROUPS_CSV="${NPA_GROUPS_CSV:-$HERE/npa-groups.csv}"
+if [[ -f "$NPA_GROUPS_CSV" ]]; then
+  _gline=0
+  while IFS= read -r _g || [[ -n "$_g" ]]; do
+    _gline=$((_gline + 1))
+    _g="${_g%$'\r'}"; _g="${_g#"${_g%%[![:space:]]*}"}"; _g="${_g%"${_g##*[![:space:]]}"}"
+    [[ -z "$_g" || "$_g" == \#* ]] && continue
+    _members=""; _n=0
+    IFS=',' read -r -a _arr <<< "$_g"
+    for _e in "${_arr[@]}"; do
+      _e="${_e//[[:space:]]/}"
+      [[ -z "$_e" ]] && continue
+      [[ "$_e" =~ ^[2-9][0-9]{2}$ ]] || \
+        die "$NPA_GROUPS_CSV:$_gline: '$_e' is not a 3-digit NPA"
+      [[ -n "${NPA_GROUP[$_e]:-}" ]] && \
+        die "$NPA_GROUPS_CSV:$_gline: NPA $_e is already in another group.
+       An NPA serves one geography; being in two groups would put its numbers
+       into pools for areas they have no presence in."
+      _members="${_members:+$_members|}$_e"; _n=$((_n + 1))
+    done
+    (( _n >= 2 )) || die "$NPA_GROUPS_CSV:$_gline: a group needs at least 2 NPAs, got $_n"
+    for _e in "${_arr[@]}"; do
+      _e="${_e//[[:space:]]/}"; [[ -z "$_e" ]] && continue
+      NPA_GROUP[$_e]="$_members"
+    done
+  done < "$NPA_GROUPS_CSV"
+  (( ${#NPA_GROUP[@]} )) && \
+    info "NPA groups: ${#NPA_GROUP[@]} NPA(s) in $(printf '%s\n' "${NPA_GROUP[@]}" | sort -u | wc -l) group(s) from $(basename "$NPA_GROUPS_CSV")"
+fi
+
+declare -A DID_POOL=() DID_MEMBER=() DID_HOME=() DID_UNIQ=()
+# DID_TOTAL counts ROWS, DID_UNIQ counts NUMBERS. They differ by a factor of
+# about two because every number appears twice in dids.csv, once under its own
+# NPA and once under OVERFLOW. Capacity must be computed from the number count:
+# the daily counter is keyed sbc/didcnt/<day>/<did>, so the two rows share one
+# 200-call budget rather than having one each.
 DID_TOTAL=0
+DID_GROUPED=0
 DID_CROSS=""
 _lineno=0
 
@@ -607,6 +670,7 @@ while IFS= read -r _line || [[ -n "$_line" ]]; do
     continue
   fi
   DID_MEMBER[$_npa/$_did]=1
+  DID_UNIQ[$_did]=1
 
   # A DID may legitimately serve several NPAs, but its daily cap is keyed on
   # the number, so the pools share one budget. Say so — an operator who
@@ -619,7 +683,37 @@ while IFS= read -r _line || [[ -n "$_line" ]]; do
 
   DID_POOL[$_npa]="${DID_POOL[$_npa]:+${DID_POOL[$_npa]}|}$_did"
   DID_TOTAL=$((DID_TOTAL + 1))
+
+  # Group expansion. A DID keyed to an NPA that shares geography with others
+  # goes into their pools too, so overlay stock actually serves the demand it
+  # was bought for. OVERFLOW is never grouped: it is a fallback bucket, not a
+  # geography.
+  if [[ "$_npa" != "OVERFLOW" && -n "${NPA_GROUP[$_npa]:-}" ]]; then
+    IFS='|' read -r -a _peers <<< "${NPA_GROUP[$_npa]}"
+    for _p in "${_peers[@]}"; do
+      [[ "$_p" == "$_npa" ]] && continue
+      [[ -n "${DID_MEMBER[$_p/$_did]:-}" ]] && continue
+      DID_MEMBER[$_p/$_did]=1
+      DID_CROSS+="${DID_CROSS:+, }$_did ($_npa~$_p)"
+      DID_POOL[$_p]="${DID_POOL[$_p]:+${DID_POOL[$_p]}|}$_did"
+      DID_GROUPED=$((DID_GROUPED + 1))
+    done
+  fi
 done < "$DIDS_CSV"
+
+# Every NPA named in a group must end up with a pool, or the group is asserting
+# a geography we own no numbers in and the operator should know the entry is
+# doing nothing.
+if (( ${#NPA_GROUP[@]} )); then
+  _empty=""
+  for _e in "${!NPA_GROUP[@]}"; do
+    [[ -n "${DID_POOL[$_e]:-}" ]] || _empty+="${_empty:+ }$_e"
+  done
+  [[ -n "$_empty" ]] && \
+    echo "  note: NPA group member(s) with no numbers in any grouped pool: $_empty" >&2
+fi
+(( DID_GROUPED > 0 )) && \
+  info "group expansion: $DID_GROUPED DID-to-pool placement(s) added from $(basename "$NPA_GROUPS_CSV")"
 
 (( DID_TOTAL > 0 )) || die "$DIDS_CSV contains no usable DIDs"
 
@@ -658,25 +752,42 @@ for _k in "${!DID_POOL[@]}"; do
           len += add; n++
         }
         print n }' <<< "$_list")"
-    die "pool SBC_DID_POOL_$_k is ${#_list} bytes ($_cnt numbers).
-
-       The dialplan passes it as a Gosub argument, which Asterisk truncates
-       at $DID_POOL_ARG_MAX bytes. Only $_fit of the $_cnt numbers would be
-       reachable; the next one would be cut mid-number and asserted as a
-       malformed caller ID, and the rest would resolve to an empty string.
-       SBC_DID_CNT_$_k would still claim $_cnt, so the dialplan would keep
-       selecting indices that cannot resolve.
-
-       This is a HARD limit of the call path, not of the config file: the
-       global itself loads fine and reads back byte-exact, which is why
-       this has to be caught here rather than at deploy time.
-
-       Reduce pool $_k to at most $_fit numbers in $DIDS_CSV.
-       See RUNBOOK.md, 'DID pool size ceilings'."
+    echo "  note: pool SBC_DID_POOL_$_k is ${#_list} bytes ($_cnt numbers), over" >&2
+    echo "        DID_POOL_ARG_MAX=$DID_POOL_ARG_MAX. This is NOT an error while the" >&2
+    echo "        selection path reads SBC_DID_P_${_k}_<idx> one member at a time:" >&2
+    echo "        no long string is expanded, so nothing truncates." >&2
+    echo "        It WOULD matter again if [sbc-did] ever went back to passing the" >&2
+    echo "        list as a Gosub argument, where only the first $_fit of $_cnt" >&2
+    echo "        numbers would be reachable and number $((_fit + 1)) would arrive" >&2
+    echo "        cut mid-digits. See RUNBOOK.md, 'DID pool size ceilings'." >&2
   fi
 
   printf 'SBC_DID_POOL_%s=%s\n' "$_k" "$_list" >> "$BLOCK_DIR/did_globals"
   printf 'SBC_DID_CNT_%s=%s\n'  "$_k" "$_cnt"  >> "$BLOCK_DIR/did_globals"
+
+  # --- per-index globals, one per member ------------------------------------
+  # STAGE 1: additive. Nothing reads these yet, and every existing global is
+  # emitted unchanged above. This exists so the selection path can stop passing
+  # the whole pool as a Gosub argument.
+  #
+  # ${GLOBAL(SBC_DID_P_<key>_<idx>)} resolves an 11-character value. No long
+  # string is ever materialised, so the 4096-byte argument buffer that
+  # truncates SBC_DID_POOL_OVERFLOW at member 341 cannot apply at any pool
+  # size. That is the whole point: it removes the ceiling rather than raising
+  # it.
+  #
+  # Cost is file size and global count, not call-path work: one extra global
+  # per DID, resolved by hash lookup at selection time instead of a CUT() walk
+  # over a pipe-delimited string.
+  _idx=0
+  while IFS= read -r _m; do
+    [[ -n "$_m" ]] || continue
+    _idx=$((_idx + 1))
+    printf 'SBC_DID_P_%s_%s=%s\n' "$_k" "$_idx" "$_m" >> "$BLOCK_DIR/did_globals"
+  done < <(tr '|' '\n' <<< "$_list")
+  (( _idx == _cnt )) || die "pool $_k: emitted $_idx per-index globals but SBC_DID_CNT_$_k says $_cnt.
+       These must agree or the selection ring will address an index that does
+       not resolve."
   [[ "$_k" != "OVERFLOW" ]] && DID_NPA_POOLS=$((DID_NPA_POOLS + 1))
 done
 
@@ -697,8 +808,9 @@ OVERFLOW_COUNT=0
 
        Add OVERFLOW rows to $DIDS_CSV. Lowering OVERFLOW_MIN is not the fix."
 
-info "DID pool: $DID_TOTAL number(s) across $DID_NPA_POOLS NPA pool(s) + $OVERFLOW_COUNT overflow"
-info "per-DID daily cap: $DID_DAILY_CAP  (pool capacity ~$((DID_TOTAL * DID_DAILY_CAP)) calls/day)"
+DID_DISTINCT=${#DID_UNIQ[@]}
+info "DID pool: $DID_DISTINCT distinct number(s), $((DID_TOTAL + DID_GROUPED)) placement(s) across $DID_NPA_POOLS NPA pool(s) + $OVERFLOW_COUNT overflow"
+info "per-DID daily cap: $DID_DAILY_CAP  (fleet capacity $((DID_DISTINCT * DID_DAILY_CAP)) calls/day)"
 [[ -n "$DID_CROSS" ]] && \
   echo "  note: DID(s) in more than one pool, sharing one daily cap: $DID_CROSS" >&2
 
@@ -945,6 +1057,7 @@ declare -A R=(
   [RTP_END]="$RTP_END"
   [MAX_CONCURRENT_PER_IP]="$MAX_CONCURRENT_PER_IP"
   [MAX_CPS]="$MAX_CPS"
+  [MAX_CPS_PER_GW]="$MAX_CPS_PER_GW"
   [NANP_ONLY]="$NANP_ONLY"
   [BLOCK_HIGH_RISK_NPA]="$BLOCK_HIGH_RISK_NPA"
   [BLOCK_976]="$BLOCK_976"
@@ -966,6 +1079,8 @@ declare -A R=(
   [TRANSFER_MIN_ACD]="$TRANSFER_MIN_ACD"
   [TRANSFER_EXPIRE_DAYS]="$TRANSFER_EXPIRE_DAYS"
   [DID_TOTAL]="$DID_TOTAL"
+  [DID_DISTINCT]="$DID_DISTINCT"
+  [DID_PLACEMENTS]="$((DID_TOTAL + DID_GROUPED))"
   [DID_NPA_POOLS]="$DID_NPA_POOLS"
   [OVERFLOW_COUNT]="$OVERFLOW_COUNT"
   [LRN_COUNT]="$LRN_COUNT"

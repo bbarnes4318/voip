@@ -1,0 +1,136 @@
+# npa-groups.csv — NPAs that serve the SAME geography, one group per line.
+#
+# An overlay is MUTUAL: 803 and 839 cover identical territory, so an 839 number
+# gives local presence for an 803 destination and vice versa. Parent/child
+# understates it, so these are groups, not mappings.
+#
+# render.sh puts every DID into the pool of every NPA in its group. A DID in
+# more than one pool shares ONE 200/day budget across them — render prints the
+# "sharing one daily cap" note listing exactly which.
+#
+# Every entry must be verified against NANPA before it is added. An unverified
+# pair asserts a caller ID from the wrong geography, which is the opposite of
+# what local presence is for, and it is invisible in the CDR because
+# did_selection_reason would read npa_match either way.
+#
+# Format: comma-separated NPAs, one group per line. An NPA may appear in at
+# most one group; render.sh fails if it appears in two.
+#
+# ---------------------------------------------------------------------------
+# VERIFIED
+# ---------------------------------------------------------------------------
+# 803/839 — all-service overlay, South Carolina, in service 2020-05-26. Same
+# geography, anchored on Columbia. FracTEL lists 839 as "SC WHITMIRE".
+803,839
+
+# ---------------------------------------------------------------------------
+# VERIFIED 2026-08-22 against NANPA / state PUC sources.
+# ---------------------------------------------------------------------------
+# 843/854 — overlay, Charleston SC, in service 2015-10-19.
+843,854
+
+# 706/762 — overlay, northern Georgia (Augusta, Columbus, Athens), since 2006-05.
+706,762
+
+# 210/726 — full overlay, San Antonio / Bexar County, since 2017-10. No split.
+210,726
+
+# 205/659 — overlay, western and central Alabama (Birmingham).
+205,659
+
+# 317/463 — overlay, Indianapolis + central Indiana (9 counties), 2016-03-15.
+317,463
+
+# 704/980 — overlay, Charlotte NC, added 2001.
+704,980
+
+# 919/984 — overlay, NC Research Triangle (Raleigh, Durham, Cary, Chapel Hill).
+919,984
+
+# 717/223 — overlay, central PA (Harrisburg, Lancaster, York), 2017.
+717,223
+
+# 215/267/445 — three codes, IDENTICAL footprint: Philadelphia, Bucks,
+# Montgomery, part of Berks. 267 added 1997, 445 added 2018-02-03.
+215,267,445
+
+# 601/769 — overlay, central Mississippi.
+601,769
+
+# 512/737 — overlay, Austin / central Texas, added 2013.
+512,737
+
+# 817/682 — overlay, Fort Worth / western metroplex, added 2000.
+817,682
+
+# 918/539 — overlay, northeast Oklahoma incl. Tulsa.
+918,539
+
+# 814/582 — overlay, northwestern Pennsylvania.
+814,582
+
+# 773/872 — 872 overlays BOTH 312 and 773 (Chicago). Safe for us in the
+# direction that matters: an 872 number is valid presence for a 773
+# destination. Do NOT add 312 — that would let a 773 number serve a 312
+# destination, which is a different part of the city.
+773,872
+
+# 724/878 — 878 overlays BOTH 412 and 724 (metro Pittsburgh). Same shape as
+# 773/872: fine for 878 stock covering 724 demand. Do NOT add 412.
+724,878
+
+# 602/480/623 — Phoenix. NOT a classic overlay: 480 (East Valley) and 623
+# (West Valley) were SPLIT from 602 in 1999 with separate geography. Arizona
+# removed the boundaries in 2023, making all three a single overlay complex.
+# Correct to group now, but for a different reason than every other entry.
+602,480,623
+
+# ---------------------------------------------------------------------------
+# HELD OUT — verified as NOT safe to group.
+# ---------------------------------------------------------------------------
+#
+# 602,480,623  Phoenix AZ. NOT a classic overlay: 480 and 623 were SPLIT from
+#              602 in 1999 with genuinely separate geography. The Arizona
+#              Corporation Commission removed the boundaries in 2023, making
+#              all three one overlay complex. Correct to group NOW, but for a
+#              different reason than the others.
+#
+# 321,407      DELIBERATELY EXCLUDED. 321 is an overlay across metro Orlando
+#              (Orange, Osceola, Seminole) but a geographic SPLIT for Brevard
+#              County, which uses 321 exclusively and is not 407 territory. A
+#              Brevard 321 number gives NO 407 local presence. Do not group
+#              until FracTEL supplies rate centres per number.
+
+# 404/470/770 — HELD OUT AS A THREE-WAY. 470 and 678 overlay the COMBINED
+# 404+770 area, but 404 (Atlanta inside I-285) and 770 (suburbs outside I-285)
+# are DIFFERENT geographies. Grouping all three would let a 404 number be
+# asserted for a 770 destination. Since the offered stock is 470 against 404
+# demand, and 770 has no stock in any form, the correct entry is the pair
+# below — it uses 470 for 404 and never mixes 404 with 770.
+404,470
+
+# 321,407 — ENABLED 2026-08-22 as a deliberate, measured bet. Read this before
+# assuming it is like the others.
+#
+# 321 is NOT a clean overlay of 407. It overlays metro Orlando (Orange,
+# Osceola, Seminole) but is a geographic SPLIT for Brevard County, which uses
+# 321 exclusively and is not 407 territory.
+#
+# FracTEL confirmed the rate centres on the offered numbers as EAU GALLIE /
+# BREVARD. That is Melbourne, roughly 60 miles from Orlando, and firmly on the
+# split side. By strict geography these are NOT Orlando numbers and give no
+# 407 local presence.
+#
+# The argument for enabling anyway: 321 is also carried across metro Orlando as
+# an overlay, so a 321 caller ID does not read as out-of-area to a 407
+# recipient. Local presence is a perception effect, and on that basis it should
+# work. That is a hypothesis, not a fact.
+#
+# So it ships WITH A TEST. Watch the 321 numbers against the fleet on 407
+# destinations: npa_match rate, answer rate, and ACD. If they underperform,
+# remove this one line, re-render, reload -- and the only loss is the monthly
+# fee on ten numbers.
+#
+# Every other entry in this file is a verified same-geography overlay. This one
+# is not, and should not be cited as precedent for grouping split NPAs.
+321,407
