@@ -453,20 +453,33 @@ sync-globals)
 
   # WHY THIS EXISTS
   #
-  # extensions.conf sets clearglobalvars=no, deliberately: it is what stops a
-  # `dialplan reload` silently wiping the killswitch and quietly restoring
-  # customer traffic while the operator believes the plug is pulled.
+  # CORRECTED 2026-08-29 (RUNBOOK.md has the full writeup and the
+  # verification commands): the claim this comment used to make - that
+  # `dialplan reload` does not apply [globals] at all - is false, and was
+  # already half-corrected once, in DEPLOY-LOG.txt 2026-08-21 214647Z, for
+  # the "creates a new global" half. The "updates an existing global" half
+  # was still wrong until now: reload DOES update an existing global's
+  # value from the file, unconditionally, on every reload, even one where
+  # the file itself never changed. clearglobalvars=no does not prevent
+  # that - it only preserves a global that is ABSENT from [globals]
+  # entirely (SBC_KILLSWITCH, by design), which is a narrower protection
+  # than "reload can't touch declared globals" and was easy to misread as
+  # the latter.
   #
-  # The cost is that `dialplan reload` then does NOT apply the [globals]
-  # section at all. It neither updates an existing global nor creates a new
-  # one. Render a new dids.csv, reload, and Asterisk keeps serving the OLD
-  # pool - with no error and no warning. The rendered file and the running
-  # dialplan disagree, and the only visible symptom is that calls keep going
-  # out on numbers you thought you had replaced.
-  #
-  # So: read [globals] out of the rendered file and set each changed value at
-  # runtime, which is the same mechanism killswitch.sh uses. No restart, no
-  # dropped calls. Run this after every render on a box carrying traffic.
+  # Given that, a plain `dialplan reload` may already correctly pick up a
+  # freshly-rendered pool for anything that fits the CLI length limit
+  # below - this script's CLI-push approach was built to work around a
+  # belief that reload does nothing, and that belief turned out to be
+  # wrong. Not changed here pending someone actually re-testing that on a
+  # pool-reload scenario specifically (this correction verified simple
+  # scalar globals, not a multi-hundred-member pool global end to end).
+  # What sync-globals still unambiguously does that a plain reload cannot:
+  # push a value that WOULD fit the CLI length limit without needing a
+  # full restart, and this script's own read-back verification, which
+  # catches anything mismatched regardless of which mechanism is actually
+  # responsible for it. Run this after every render on a box carrying
+  # traffic, same as before - just don't assume "reload alone does
+  # nothing" is why it's needed.
   WANT="$(awk '/^\[globals\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z_][A-Za-z0-9_]*=/{print}' "$CONF_FILE")"
   [[ -n "$WANT" ]] || die "no [globals] block found in $CONF_FILE"
 

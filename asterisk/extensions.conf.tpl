@@ -63,6 +63,13 @@ static=yes
 writeprotect=yes
 autofallthrough=yes
 ; Runtime globals (the killswitch) must survive a 'dialplan reload'.
+; This protects ONLY globals never declared below in [globals] - verified
+; live 2026-08-29 (see RUNBOOK.md): SBC_KILLSWITCH, set at runtime and
+; absent from [globals] by design, survives a plain reload unchanged.
+; Anything that IS declared below (SBC_MAX_CPS, SBC_MAX_CONCURRENT, every
+; limit in this file) gets silently overwritten back to ITS value on
+; every reload regardless of clearglobalvars - a runtime override to any
+; of those does not survive a reload, warning or no warning either way.
 clearglobalvars=no
 
 

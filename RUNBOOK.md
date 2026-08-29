@@ -335,18 +335,47 @@ flag only skips package installation, not the restart. Use it only during a
 drain window (`killswitch.sh on`, wait for channels to reach zero, restart,
 `killswitch.sh off`).
 
-> **`dialplan reload` on its own is NOT enough, and it fails silently.**
+> **CORRECTED 2026-08-29 — the claim below that reload doesn't apply
+> `[globals]` at all is false, and was already half-corrected once
+> (DEPLOY-LOG.txt, 2026-08-21 214647Z, re: new globals loading fine on
+> reload). Re-tested against the same Asterisk 20.6.0 build on the lab box
+> and the other half is false too: `dialplan reload` DOES apply `[globals]`
+> for EXISTING globals as well, unconditionally — it overwrites whatever
+> runtime value was there with the file's value, on every reload, even a
+> reload where the file itself didn't change. Verified both ways: a fresh
+> `dialplan set global SBC_MAX_CPS 999` (file still says `50`, untouched)
+> reverted to `50` on a plain reload with no file edit at all.**
 >
-> `extensions.conf` sets `clearglobalvars=no` deliberately — it is what stops a
-> reload wiping the killswitch and quietly restoring customer traffic while you
-> believe the plug is pulled. The cost is that **`dialplan reload` does not
-> apply the `[globals]` section at all**: it neither updates an existing global
-> nor creates a new one.
+> **What this means for the killswitch specifically: it's fine.**
+> `SBC_KILLSWITCH` is deliberately never declared in `[globals]` (see
+> `extensions.conf.tpl`) — `clearglobalvars=no` protects exactly this case,
+> a runtime-only global with no entry in the file to overwrite it. Verified
+> live: `dialplan set global SBC_KILLSWITCH 1` survives a plain
+> `dialplan reload` unchanged. The original claim that this setting is
+> "what stops a reload wiping the killswitch" is correct, but was stated in
+> a way that reads as "clearglobalvars=no protects every global", which is
+> **not** true and never has been.
 >
-> So you can render a new `dids.csv`, run `dialplan reload`, get
-> `Dialplan reloaded.` and exit 0, and have Asterisk still serving the **old**
-> pool. No error, no warning. Measured on the live box during the 172-DID
-> rollout: after render + reload the file had 64 pools and Asterisk had 1.
+> **What this means for anything that IS in `[globals]`** — every limit in
+> there (`SBC_MAX_CPS`, `SBC_MAX_CONCURRENT`, `SBC_NANP_ONLY`,
+> `SBC_BLOCK_NPA`, `SBC_BLOCK_976`, `SBC_VALIDATE_CID`, `SBC_MAX_ATTEMPTS`,
+> the DID pools, all of it) — is the opposite of protected: any operator who
+> bumps one of these via `dialplan set global` for an incident (e.g.
+> lowering `SBC_MAX_CPS` to shed load) will have it **silently discarded**
+> by the next `dialplan reload`, whatever that reload was actually for.
+> There is no warning either direction. If you rely on a temporary override
+> to a file-declared global, re-verify it after any reload, or restart
+> instead if a reload might happen underneath you.
+>
+> **Open question, not resolved here:** since reload appears to correctly
+> apply BOTH new and existing `[globals]` entries, it's not clear
+> `sync-globals`'s CLI-based push-each-value approach is still needed for
+> pools that fit the ~490-byte command limit — a plain reload may already
+> do the same job more simply for those. The CLI-length problem for
+> oversized globals (`SBC_DID_POOL_OVERFLOW` and friends, below) is a real,
+> separate, already-correctly-diagnosed limitation of the CLI push path
+> specifically, and is untouched by this correction. Flagging the overlap
+> for whoever owns this tool next, not resolving it unilaterally.
 >
 > `didctl.sh sync-globals` reads `[globals]` out of the rendered file and
 > applies each changed value with `dialplan set global` — the same runtime
